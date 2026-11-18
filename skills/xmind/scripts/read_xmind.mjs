@@ -4,112 +4,63 @@
 // Usage: echo '{"action":"read","path":"/tmp/file.xmind"}' | node read_xmind.mjs
 // No external dependencies — uses only Node.js built-ins.
 
-import { readFileSync, readdirSync, statSync, existsSync, writeFileSync } from 'fs';
-import { resolve, join, basename, normalize, extname } from 'path';
-import { inflateRawSync } from 'zlib';
-import { pbkdf2Sync, createDecipheriv } from 'crypto';
+import { readFileSync, readdirSync, statSync, lstatSync } from 'fs';
+import { resolve, join, basename, normalize } from 'path';
+import { buildZip } from './lib/zip.mjs';
+import { openZip } from './lib/crypto.mjs';
+import { validateBuffer } from './lib/validate.mjs';
+import { listLibrary } from './lib/asar.mjs';
+import { TOPIC_INPUT_FIELDS, IMAGE_KEYS } from './lib/known.mjs';
+import { writeFileAtomicSync, sanitizeNoteHtml } from './lib/util.mjs';
 
-// Password for protected files (the "password" field of the request).
-let PASSWORD = null;
 
 // ─── Minimal ZIP reader (PKZIP APPNOTE 6.3.3) ───
 
-// readZip + transparent decryption of password-protected entries. XMind encrypts each entry with
-// AES-CBC; key = PBKDF2-HMAC-SHA512(password, salt, iterations); parameters are in manifest.json.
-function openZip(buf) {
-    const zip = readZip(buf);
-    let entries = {};
-    if (zip.names().includes('manifest.json')) {
-        try { entries = JSON.parse(zip.extract('manifest.json').toString('utf-8'))['file-entries'] || {}; } catch { /* no manifest */ }
-    }
-    let hint = null;
-    try { hint = JSON.parse(zip.extract('manifest.json')?.toString('utf-8') || '{}')['password-hint'] || null; } catch { /* ignore */ }
-    return {
-        names: () => zip.names(),
-        encrypted: Object.values(entries).some(e => e?.['encryption-data']),
-        passwordHint: hint,
-        extract(name) {
-            const data = zip.extract(name);
-            const enc = entries[name]?.['encryption-data'];
-            if (!data || !enc) return data;
-            if (!PASSWORD) {
-                throw new Error(`This file is password-protected${hint ? ` (hint: ${hint})` : ''} — pass "password".`);
-            }
-            const keyLen = (Number(enc.size) || 128) / 8;
-            const key = pbkdf2Sync(Buffer.from(PASSWORD, 'utf-8'), Buffer.from(enc.salt, 'base64'),
-                Number(enc['iteration-count']) || 1024, keyLen, 'sha512');
-            try {
-                const d = createDecipheriv(`aes-${keyLen * 8}-cbc`, key, enc.iv ? Buffer.from(enc.iv, 'base64') : Buffer.alloc(16));
-                return Buffer.concat([d.update(data), d.final()]);
-            } catch {
-                throw new Error('Wrong password.');
-            }
-        },
-    };
-}
-
-function readZip(buf) {
-    // Find End of Central Directory record (scan backwards)
-    let eocdOffset = -1;
-    for (let i = buf.length - 22; i >= 0; i--) {
-        if (buf.readUInt32LE(i) === 0x06054b50) {
-            eocdOffset = i;
-            break;
-        }
-    }
-    if (eocdOffset === -1) throw new Error('Invalid ZIP: EOCD not found');
-
-    const cdEntries = buf.readUInt16LE(eocdOffset + 10);
-    const cdSize = buf.readUInt32LE(eocdOffset + 12);
-    const cdOffset = buf.readUInt32LE(eocdOffset + 16);
-
-    // Read Central Directory entries
-    const files = new Map();
-    let pos = cdOffset;
-    for (let i = 0; i < cdEntries; i++) {
-        if (buf.readUInt32LE(pos) !== 0x02014b50) throw new Error('Invalid ZIP: bad CD entry');
-        const compression = buf.readUInt16LE(pos + 10);
-        const compressedSize = buf.readUInt32LE(pos + 20);
-        const uncompressedSize = buf.readUInt32LE(pos + 24);
-        const nameLen = buf.readUInt16LE(pos + 28);
-        const extraLen = buf.readUInt16LE(pos + 30);
-        const commentLen = buf.readUInt16LE(pos + 32);
-        const localHeaderOffset = buf.readUInt32LE(pos + 42);
-        const name = buf.toString('utf-8', pos + 46, pos + 46 + nameLen);
-
-        files.set(name, { compression, compressedSize, uncompressedSize, localHeaderOffset });
-        pos += 46 + nameLen + extraLen + commentLen;
-    }
-
-    return {
-        extract(name) {
-            const entry = files.get(name);
-            if (!entry) return null;
-
-            // Read Local File Header to get actual data offset
-            const lhOffset = entry.localHeaderOffset;
-            if (buf.readUInt32LE(lhOffset) !== 0x04034b50) throw new Error('Invalid ZIP: bad local header');
-            const lhNameLen = buf.readUInt16LE(lhOffset + 26);
-            const lhExtraLen = buf.readUInt16LE(lhOffset + 28);
-            const dataOffset = lhOffset + 30 + lhNameLen + lhExtraLen;
-            const rawData = buf.subarray(dataOffset, dataOffset + entry.compressedSize);
-
-            if (entry.compression === 0) return rawData;
-            if (entry.compression === 8) return inflateRawSync(rawData);
-            throw new Error(`Unsupported compression method: ${entry.compression}`);
-        },
-        names() { return [...files.keys()]; },
-    };
-}
-
 // ─── Minimal XML parser (for XMind 8 legacy content.xml) ───
+
+// Named and numeric character references (&amp; &#10; &#x4E2D;) — unknown names are kept as written.
+const NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+function decodeEntities(s) {
+    return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, e) => {
+        if (e[0] === '#') {
+            const cp = e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+            return Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF ? String.fromCodePoint(cp) : m;
+        }
+        return NAMED_ENTITIES[e.toLowerCase()] ?? m;
+    });
+}
+
+function xmlError(what) {
+    return new Error(`Invalid XMind 8 file: ${what} — the file looks damaged or truncated`);
+}
+
+function stripDeclarations(xml) {
+    let out = '', i = 0;
+    const lower = xml.toLowerCase();
+    // Each search resumes from its last hit and stops for good once a marker is absent, so the
+    // whole scan is linear however many declarations the file holds.
+    let pi = -2, dt = -2;
+    while (i < xml.length) {
+        if (pi !== -1 && pi < i) pi = xml.indexOf('<?', i);
+        if (dt !== -1 && dt < i) dt = lower.indexOf('<!doctype', i);
+        const next = pi === -1 ? dt : dt === -1 ? pi : Math.min(pi, dt);
+        if (next === -1) { out += xml.slice(i); break; }
+        out += xml.slice(i, next);
+        const end = next === pi ? xml.indexOf('?>', next + 2) : xml.indexOf('>', next + 9);
+        if (end === -1) throw xmlError(next === pi ? 'unterminated <?…?> declaration' : 'unterminated <!DOCTYPE');
+        i = end + (next === pi ? 2 : 1);
+    }
+    return out.trim();
+}
 
 function parseXml(xml) {
     // Returns a tree of {tag, attrs, children, text}
     let pos = 0;
 
-    // Strip all processing instructions (<?...?>) and DOCTYPE declarations
-    xml = xml.replace(/<\?[^?]*\?>/g, '').replace(/<!DOCTYPE[^>]*>/gi, '').trim();
+    // Strip processing instructions (<?...?>) and DOCTYPE declarations — by scanning, not a regex,
+    // so a crafted file full of unterminated "<!DOCTYPE" can't make this quadratic. A DTD is never
+    // processed (no entity expansion, no external entities).
+    xml = stripDeclarations(xml);
 
     function skipWhitespace() {
         while (pos < xml.length && /\s/.test(xml[pos])) pos++;
@@ -131,31 +82,10 @@ function parseXml(xml) {
                 pos++; // skip =
                 skipWhitespace();
                 const quote = xml[pos++]; // " or '
-                let val = '';
-                while (pos < xml.length && xml[pos] !== quote) {
-                    if (xml[pos] === '&') {
-                        // Basic entity decode
-                        const semi = xml.indexOf(';', pos);
-                        if (semi !== -1) {
-                            const entity = xml.substring(pos + 1, semi);
-                            if (entity === 'amp') val += '&';
-                            else if (entity === 'lt') val += '<';
-                            else if (entity === 'gt') val += '>';
-                            else if (entity === 'quot') val += '"';
-                            else if (entity === 'apos') val += "'";
-                            else if (entity.startsWith('#x')) val += String.fromCharCode(parseInt(entity.slice(2), 16));
-                            else if (entity.startsWith('#')) val += String.fromCharCode(parseInt(entity.slice(1), 10));
-                            else val += `&${entity};`;
-                            pos = semi + 1;
-                        } else {
-                            val += xml[pos++];
-                        }
-                    } else {
-                        val += xml[pos++];
-                    }
-                }
-                pos++; // skip closing quote
-                attrs[name] = val;
+                const end = xml.indexOf(quote, pos);
+                if (end < 0) throw xmlError(`unterminated attribute "${name}"`);
+                attrs[name] = decodeEntities(xml.substring(pos, end));
+                pos = end + 1; // skip closing quote
             } else {
                 attrs[name] = name; // boolean attribute
             }
@@ -169,7 +99,9 @@ function parseXml(xml) {
 
         // Skip comments
         if (xml.startsWith('<!--', pos)) {
-            pos = xml.indexOf('-->', pos) + 3;
+            const end = xml.indexOf('-->', pos + 4);
+            if (end < 0) throw xmlError('unterminated comment');
+            pos = end + 3;
             return parseElement();
         }
 
@@ -188,6 +120,7 @@ function parseXml(xml) {
             pos += 2; // skip />
             return { tag, attrs, children: [], text: '' };
         }
+        if (pos >= xml.length) throw xmlError(`<${tag}> is cut off`);
         pos++; // skip >
 
         // Parse children and text content
@@ -195,6 +128,7 @@ function parseXml(xml) {
         const children = [];
         const parts = [];
         let text = '';
+        let closed = false;
 
         while (pos < xml.length) {
             if (xml.startsWith('<![CDATA[', pos)) {
@@ -215,11 +149,15 @@ function parseXml(xml) {
                 if (xml[pos + 1] === '/') {
                     // Closing tag
                     const end = xml.indexOf('>', pos);
+                    if (end < 0) throw xmlError(`closing tag of <${tag}> is cut off`);
                     pos = end + 1;
+                    closed = true;
                     break;
                 }
                 if (xml.startsWith('<!--', pos)) {
-                    pos = xml.indexOf('-->', pos) + 3;
+                    const end = xml.indexOf('-->', pos + 4);
+                    if (end < 0) throw xmlError('unterminated comment');
+                    pos = end + 3;
                     continue;
                 }
                 const child = parseElement();
@@ -233,12 +171,12 @@ function parseXml(xml) {
                 while (pos < xml.length && xml[pos] !== '<') {
                     t += xml[pos++];
                 }
-                // Decode entities in text
-                t = t.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+                t = decodeEntities(t);
                 text += t;
                 parts.push({ type: 'text', value: t });
             }
         }
+        if (!closed) throw xmlError(`<${tag}> is never closed`);
 
         return { tag, attrs, children, text: text.trim(), parts };
     }
@@ -276,6 +214,16 @@ function xmlAttr(el, name) {
     return '';
 }
 
+// A task date from the file, or null when it isn't a usable timestamp (one bad date must not fail the read).
+function isoDate(v) {
+    if (v === undefined || v === null || v === '') return null;
+    const d = new Date(typeof v === 'string' && /^\d+$/.test(v) ? Number(v) : v);
+    return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+}
+
+const escHtml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const SAFE_LINK = /^(https?:|mailto:|xmind:#)/i;
+
 // Reconstruct HTML from XMind 8 xhtml:* elements, preserving mixed content order via `parts`
 function reconstructHtml(el) {
     let html = '';
@@ -286,14 +234,15 @@ function reconstructHtml(el) {
     }
     for (const part of items) {
         if (part.type === 'text') {
-            html += part.value;
+            // Entities were decoded while parsing; escape again so text can't become markup.
+            html += escHtml(part.value);
         } else if (part.type === 'element') {
             const child = part.value;
             const localTag = child.tag.includes(':') ? child.tag.split(':').pop() : child.tag;
             if (['p', 'span', 'strong', 'em', 'u', 'br', 'ul', 'ol', 'li', 'a', 'img', 'b', 'i', 'sub', 'sup', 'del', 's'].includes(localTag)) {
-                const styleAttr = child.attrs?.style ? ` style="${child.attrs.style}"` : '';
+                const styleAttr = child.attrs?.style ? ` style="${escHtml(child.attrs.style)}"` : '';
                 const hrefAttr = child.attrs?.['xlink:href'] || child.attrs?.href;
-                const hrefStr = hrefAttr ? ` href="${hrefAttr}"` : '';
+                const hrefStr = hrefAttr && SAFE_LINK.test(hrefAttr) ? ` href="${escHtml(hrefAttr)}"` : '';
                 if (localTag === 'br' || localTag === 'img') {
                     html += `<${localTag}${styleAttr}/>`;
                 } else {
@@ -340,9 +289,9 @@ function processXmlTopic(topicEl, sheetTitle) {
             } else {
                 // Skip xmlns declarations
                 if (key.startsWith('xmlns')) continue;
-                // Store unknown attribute directly (camelCase the key)
+                // Store unknown attribute directly (camelCase the key) — never as a field create acts on.
                 const camel = key.replace(/[-:]([a-z])/g, (_, c) => c.toUpperCase());
-                result[camel] = val;
+                if (!TOPIC_INPUT_FIELDS.has(camel)) result[camel] = val;
             }
         }
     }
@@ -376,11 +325,10 @@ function processXmlTopic(topicEl, sheetTitle) {
                 result.notes.content = contentEl ? contentEl.text : plainEl.text;
             }
             if (htmlEl) {
-                if (htmlEl.text) {
-                    result.notes.html = htmlEl.text;
-                } else if (htmlEl.children?.length > 0) {
-                    result.notes.html = reconstructHtml(htmlEl);
-                }
+                // Text directly in <html> (how this skill's writer stores it, as CDATA) is reduced to
+                // plain formatting tags; xhtml:* elements are rebuilt with their text escaped again.
+                const html = htmlEl.children?.length > 0 ? reconstructHtml(htmlEl) : sanitizeNoteHtml(htmlEl.text || '');
+                if (html) result.notes.html = html;
             }
         }
     }
@@ -399,11 +347,14 @@ function processXmlTopic(topicEl, sheetTitle) {
     if (imageEl) {
         const src = imageEl.attrs?.['xhtml:src'] || imageEl.attrs?.src ||
                     xmlAttr(imageEl, 'src') || xmlAttr(imageEl, 'xhtml:src');
-        if (src) result.image = { src };
+        if (src && src.startsWith('xap:')) result.image = { src };  // embedded only, never a disk path
         const w = imageEl.attrs?.['svg:width'] || xmlAttr(imageEl, 'width');
         const h = imageEl.attrs?.['svg:height'] || xmlAttr(imageEl, 'height');
-        if (w && result.image) result.image.width = w;
-        if (h && result.image) result.image.height = h;
+        // Numbers, like the modern format (and what create_xmind.mjs accepts back).
+        if (w && result.image && Number(w) > 0) result.image.width = Number(w);
+        if (h && result.image && Number(h) > 0) result.image.height = Number(h);
+        const align = imageEl.attrs?.align || xmlAttr(imageEl, 'align');
+        if (align && result.image) result.image.align = align;
     }
 
     // ── Numbering ──
@@ -493,8 +444,8 @@ function processXmlTopic(topicEl, sheetTitle) {
                 if (status) result.taskStatus = status;
                 if (progress) result.progress = parseFloat(progress);
                 if (priority) result.priority = parseInt(priority, 10);
-                if (start) result.startDate = new Date(parseInt(start, 10)).toISOString();
-                if (due) result.dueDate = new Date(parseInt(due, 10)).toISOString();
+                if (start && isoDate(parseInt(start, 10))) result.startDate = isoDate(parseInt(start, 10));
+                if (due && isoDate(parseInt(due, 10))) result.dueDate = isoDate(parseInt(due, 10));
                 if (duration) result.duration = parseInt(duration, 10);
 
                 const depsEl = xmlFindOne(contentEl, 'dependencies');
@@ -535,8 +486,7 @@ function processXmlTopic(topicEl, sheetTitle) {
             if (shape) result.shape = shape;
             // Capture all style properties
             if (propsEl.attrs && Object.keys(propsEl.attrs).length > 0) {
-                if (!result.styleProperties) result.styleProperties = {};
-                Object.assign(result.styleProperties, propsEl.attrs);
+                result.style = boundedStyle({ ...(result.style || {}), ...propsEl.attrs });
             }
         }
     }
@@ -579,6 +529,19 @@ function serializeXmlElement(el) {
 }
 
 // Parse styles.xml into a map of style-id → {properties}
+// A real XMind style has a few dozen properties. A shared style is copied onto every topic that uses
+// it, so its size is bounded: a crafted styles.xml can't turn a small file into a huge read.
+const MAX_STYLE_PROPS = 64, MAX_STYLE_VALUE = 256;
+function boundedStyle(props) {
+    const out = {};
+    let n = 0;
+    for (const [k, v] of Object.entries(props || {})) {
+        if (n++ >= MAX_STYLE_PROPS) break;
+        if (k.length <= 64 && String(v).length <= MAX_STYLE_VALUE) out[k] = v;
+    }
+    return out;
+}
+
 function parseStylesXml(zip) {
     const stylesMap = new Map();
     const stylesRaw = zip.extract('styles.xml');
@@ -599,7 +562,7 @@ function parseStylesXml(zip) {
                         if (child.attrs) Object.assign(props, child.attrs);
                     }
                 }
-                stylesMap.set(id, props);
+                stylesMap.set(id, boundedStyle(props));
             }
         }
     } catch { /* ignore style parse errors */ }
@@ -611,8 +574,7 @@ function resolveTopicStyle(result, stylesMap) {
     if (result.styleId && stylesMap.has(result.styleId)) {
         const props = stylesMap.get(result.styleId);
         if (props['shape-class'] && !result.shape) result.shape = props['shape-class'];
-        if (!result.styleProperties) result.styleProperties = {};
-        Object.assign(result.styleProperties, props);
+        result.style = { ...props, ...(result.style || {}) };
     }
     // Recurse into children
     if (result.children) {
@@ -623,9 +585,19 @@ function resolveTopicStyle(result, stylesMap) {
     }
 }
 
-function parseXMindLegacy(filePath) {
-    const buf = readFileSync(resolve(filePath));
-    const zip = openZip(buf);
+// Same shape as the modern reader: `style` holds XMind's own property names without the shape
+// (which is `shape`), so create_xmind.mjs takes a legacy read verbatim — also when converting to zen.
+function finishLegacyStyle(result) {
+    if (result.style) {
+        const { 'shape-class': _shape, 'fo:shape-class': _foShape, ...rest } = result.style;
+        if (Object.keys(rest).length > 0) result.style = rest;
+        else delete result.style;
+    }
+    for (const child of result.children || []) finishLegacyStyle(child);
+    for (const dt of result.detachedTopics || []) finishLegacyStyle(dt);
+}
+
+function parseXMindLegacy(zip) {
     const contentRaw = zip.extract('content.xml');
     if (!contentRaw) throw new Error('content.xml not found in XMind file');
     const xmlStr = contentRaw.toString('utf-8');
@@ -707,21 +679,12 @@ function parseXMindLegacy(filePath) {
 
         // Resolve style-id → shape/properties from styles.xml
         if (stylesMap.size > 0) resolveTopicStyle(rootNode, stylesMap);
+        finishLegacyStyle(rootNode);
 
         return rootNode;
     });
 }
 
-// ─── Format detection ───
-
-function detectFormat(filePath) {
-    const buf = readFileSync(resolve(filePath));
-    const zip = openZip(buf);
-    const names = zip.names();
-    if (names.includes('content.json')) return 'zen';
-    if (names.includes('content.xml')) return 'legacy';
-    throw new Error('Unknown XMind format: neither content.json nor content.xml found');
-}
 
 // ─── XMind Parser (new JSON format) ───
 
@@ -740,7 +703,10 @@ function processNode(node, sheetTitle) {
         const { 'shape-class': _shape, ...rest } = node.style.properties;
         if (Object.keys(rest).length > 0) result.style = rest;
     }
-    if (node.image?.src && !node.image.isMathJaxImage) result.image = node.image;
+    if (typeof node.image?.src === 'string' && node.image.src.startsWith('xap:') && !node.image.isMathJaxImage) {
+        result.image = {};
+        for (const k of IMAGE_KEYS) if (node.image[k] != null) result.image[k] = node.image[k];
+    }
     if (node.position) result.position = node.position;
     if (node.branch === 'folded') result.folded = true;
     // Rich-text title runs, in the friendly shape create_xmind.mjs accepts.
@@ -767,7 +733,7 @@ function processNode(node, sheetTitle) {
     const video = ext('org.xmind.ui.webVideo')?.content;
     if (video?.url) result.video = { url: video.url, embedUrl: video.embedUrl };
     const audio = ext('org.xmind.ui.audionotes')?.resources?.[0];
-    if (audio) result.audio = audio;
+    if (typeof audio === 'string' && audio.startsWith('xap:')) result.audio = audio;
     const preview = ext('org.xmind.ui.linkPreview')?.content;
     if (preview && typeof preview === 'object') {
         const lp = {};
@@ -824,8 +790,8 @@ function processNode(node, sheetTitle) {
             if (c.progress !== undefined) result.progress = c.progress;
             if (c.priority !== undefined) result.priority = c.priority;
             if (c.duration !== undefined) result.duration = c.duration;
-            if (c.start !== undefined) result.startDate = new Date(c.start).toISOString();
-            if (c.due !== undefined) result.dueDate = new Date(c.due).toISOString();
+            if (isoDate(c.start)) result.startDate = isoDate(c.start);
+            if (isoDate(c.due)) result.dueDate = isoDate(c.due);
             if (c.dependencies?.length > 0) result.dependencies = c.dependencies;
         }
     }
@@ -864,9 +830,7 @@ function sheetExtrasOf(sheet) {
     return out;
 }
 
-function parseXMindZen(filePath) {
-    const buf = readFileSync(resolve(filePath));
-    const zip = openZip(buf);
+function parseXMindZen(zip) {
     const contentRaw = zip.extract('content.json');
     if (!contentRaw) return [];
     // Strip UTF-8 BOM if present
@@ -912,45 +876,75 @@ function parseXMindZen(filePath) {
     }).filter(Boolean);
 }
 
-function parseXMind(filePath) {
-    const buf = readFileSync(resolve(filePath));
-    const zip = openZip(buf);
+// The file is read and unzipped once; the parsers get the open archive.
+function parseXMind(filePath, password = null) {
+    const zip = openZip(readFileSync(resolve(filePath)), password);
     const names = zip.names();
     const hasJson = names.includes('content.json');
     const hasXml = names.includes('content.xml');
 
     // Try zen (JSON) first; fall back to legacy (XML) if result is empty
     if (hasJson) {
-        const result = parseXMindZen(filePath);
+        const result = parseXMindZen(zip);
         if (result.length > 0) return result;
         // Zen was empty/stub — fall through to legacy if available
-        if (hasXml) return parseXMindLegacy(filePath);
+        if (hasXml) return parseXMindLegacy(zip);
         return result;
     }
-    if (hasXml) return parseXMindLegacy(filePath);
+    if (hasXml) return parseXMindLegacy(zip);
     throw new Error('Unknown XMind format: neither content.json nor content.xml found');
 }
 
-// ─── Helper: extract raw content.json text ───
+// sheetTitle is kept on the sheet's root topic only — repeating it on every node only costs tokens.
+function stripSheetTitles(node, keep = true) {
+    if (!node || typeof node !== 'object') return node;
+    if (!keep) delete node.sheetTitle;
+    for (const c of node.children || []) stripSheetTitles(c, false);
+    for (const d of node.detachedTopics || []) stripSheetTitles(d, false);
+    return node;
+}
 
-function extractContentText(filePath) {
-    try {
-        const buf = readFileSync(resolve(filePath));
-        const zip = openZip(buf);
-        // Try JSON first, then XML
-        const rawJson = zip.extract('content.json');
-        if (rawJson) return rawJson.toString('utf-8');
-        const rawXml = zip.extract('content.xml');
-        if (rawXml) return rawXml.toString('utf-8');
-        return null;
-    } catch { return null; }
+// ─── Helper: the words a person sees in a map (not its JSON / XML markup) ───
+
+// Sheet and topic titles, notes, labels, callouts, summaries, boundaries and relationship titles — so a
+// search for "topic" or "class" doesn't match every file through its markup. null if unreadable
+// (e.g. password-protected without a password).
+function extractContentText(filePath, password = null) {
+    let roots;
+    try { roots = parseXMind(filePath, password); } catch { return null; }
+    const out = [];
+    const strip = h => String(h || '').replace(/<[^<>]*>/g, ' ');
+    const walk = t => {
+        out.push(t.title, t.notes?.content, strip(t.notes?.html), ...(t.labels || []),
+            ...(t.callouts || []).map(c => c.title), ...(t.summaries || []).map(x => x.topicTitle),
+            ...(t.boundaries || []).map(b => b.title), ...(t.relationships || []).map(r => r.title));
+        for (const c of t.children || []) walk(c);
+        for (const d of t.detachedTopics || []) walk(d);
+    };
+    for (const r of roots) { out.push(r.sheetTitle); walk(r); }
+    return out.filter(Boolean).join('\n');
 }
 
 // ─── Actions ───
 
+// maxDepth: keep topics down to that depth (root = 0); deeper ones are replaced by childCount.
+function limitDepth(node, maxDepth, depth = 0) {
+    if (maxDepth == null) return node;
+    for (const key of ['children', 'detachedTopics']) {
+        if (!node[key]) continue;
+        if (depth >= maxDepth) {
+            node.childCount = (node.childCount || 0) + node[key].length;
+            delete node[key];
+        } else {
+            node[key].forEach(c => limitDepth(c, maxDepth, depth + 1));
+        }
+    }
+    return node;
+}
+
 function actionRead(input) {
     if (!input.path) throw new Error('Missing "path"');
-    return parseXMind(input.path);
+    return parseXMind(input.path, input.password).map(r => limitDepth(stripSheetTitles(r), input.maxDepth));
 }
 
 function actionList(input) {
@@ -986,11 +980,13 @@ function actionSearchFiles(input) {
             if (e.isDirectory()) { scan(full); continue; }
             if (!e.isFile() || !e.name.toLowerCase().endsWith('.xmind')) continue;
 
-            const searchable = [e.name.toLowerCase(), basename(e.name, '.xmind').toLowerCase(), full.toLowerCase()];
+            // The file name or its path below the searched directory (not the directory itself, which
+            // every file shares).
+            const searchable = [e.name.toLowerCase(), full.slice(dir.length + 1).toLowerCase()];
             if (pattern === '' || searchable.some(t => t.includes(pattern))) {
                 filenameMatches.push(full);
             } else {
-                const text = extractContentText(full);
+                const text = extractContentText(full, input.password);
                 if (text && text.toLowerCase().includes(pattern)) contentMatches.push(full);
             }
         }
@@ -1005,7 +1001,7 @@ function actionReadMultiple(input) {
     if (!input.paths?.length) throw new Error('Missing "paths"');
     return input.paths.map(filePath => {
         try {
-            return { filePath, content: parseXMind(filePath) };
+            return { filePath, content: parseXMind(filePath, input.password).map(r => limitDepth(stripSheetTitles(r), input.maxDepth)) };
         } catch (err) {
             return { filePath, content: [], error: err.message };
         }
@@ -1020,23 +1016,41 @@ function getNodePath(node, parents = []) {
 
 function actionExtractNode(input) {
     if (!input.path || !input.searchQuery) throw new Error('Missing "path" or "searchQuery"');
-    const sheets = parseXMind(input.path);
+    const sheets = parseXMind(input.path, input.password);
 
-    function calculateRelevance(nodePath, query) {
-        const pathLower = nodePath.toLowerCase();
-        const queryLower = query.toLowerCase();
-        if (pathLower.includes(queryLower)) return 1.0;
-        const pathWords = pathLower.split(/[\s>]+/);
-        const queryWords = queryLower.split(/[\s>]+/);
-        const matching = queryWords.filter(w => pathWords.some(pw => pw.includes(w)));
-        return matching.length / queryWords.length;
+    // The topic's own title counts most; a word found only in an ancestor counts half, so searching a
+    // parent's name no longer matches every descendant. Words of 1–2 characters must match exactly.
+    const words = t => String(t || '').toLowerCase().split(/[\s>/,.;:()\[\]"'!?-]+/).filter(Boolean);
+    const wordHit = (w, list) => list.some(x => (w.length >= 3 ? x.includes(w) : x === w));
+    function calculateRelevance(title, parents, query) {
+        const t = String(title || '').toLowerCase(), q = query.toLowerCase().trim();
+        if (!q) return 0;
+        if (t === q) return 1.0;
+        // Substring match only for queries of 3+ characters; a short query must be a whole word.
+        if (q.length >= 3 ? t.includes(q) : words(t).includes(q)) return 0.9;
+        const qw = words(q), tw = words(t), aw = parents.flatMap(words);
+        if (qw.length === 0) return 0;
+        const score = qw.reduce((sum, w) => sum + (wordHit(w, tw) ? 1 : wordHit(w, aw) ? 0.5 : 0), 0);
+        return Math.round((score / qw.length) * 0.85 * 100) / 100;
     }
+
+    // The matched topic without its subtree (childCount says how much is below); includeChildren: true
+    // returns the whole subtree.
+    const summarize = node => {
+        if (input.includeChildren) return stripSheetTitles({ ...node }, false);
+        const { children, detachedTopics, ...rest } = node;
+        delete rest.sheetTitle;
+        const childCount = (children?.length || 0) + (detachedTopics?.length || 0);
+        return childCount ? { ...rest, childCount } : rest;
+    };
 
     function findFuzzy(node, query, parents = []) {
         const results = [];
         const currentPath = getNodePath(node, parents);
-        const confidence = calculateRelevance(currentPath, query);
-        if (confidence > 0.5) results.push({ node, matchConfidence: confidence, path: currentPath });
+        const confidence = calculateRelevance(node.title, parents, query);
+        if (confidence > 0.5) {
+            results.push({ node: summarize(node), matchConfidence: confidence, path: currentPath, sheet: node.sheetTitle });
+        }
         const newParents = [...parents, node.title];
         if (node.children) {
             for (const child of node.children) results.push(...findFuzzy(child, query, newParents));
@@ -1051,7 +1065,7 @@ function actionExtractNode(input) {
     allMatches.sort((a, b) => b.matchConfidence - a.matchConfidence);
 
     return {
-        matches: allMatches.slice(0, 5),
+        matches: allMatches.slice(0, input.limit || 5),
         totalMatches: allMatches.length,
         query: input.searchQuery,
     };
@@ -1059,7 +1073,7 @@ function actionExtractNode(input) {
 
 function actionExtractNodeById(input) {
     if (!input.path || !input.nodeId) throw new Error('Missing "path" or "nodeId"');
-    const sheets = parseXMind(input.path);
+    const sheets = parseXMind(input.path, input.password);
 
     function findById(node, id) {
         if (node.id === id) return node;
@@ -1080,17 +1094,24 @@ function actionExtractNodeById(input) {
 
     for (const sheet of sheets) {
         const found = findById(sheet, input.nodeId);
-        if (found) return { found: true, node: found };
+        if (found) return { found: true, sheet: found.sheetTitle, node: stripSheetTitles({ ...found }, false) };
     }
     return { found: false, error: `Node not found: ${input.nodeId}` };
 }
 
 function actionSearchNodes(input) {
-    if (!input.path || (input.query == null && !input.taskStatus)) throw new Error('Missing "path" and "query" or "taskStatus"');
-    const sheets = parseXMind(input.path);
-    const searchFields = input.searchIn || ['title', 'notes', 'labels', 'callouts', 'tasks'];
+    if (!input.path) throw new Error('Missing "path"');
+    if (input.query == null && !input.taskStatus && !(input.searchIn || []).includes('tasks')) {
+        throw new Error('Give "query", "taskStatus", or "searchIn": ["tasks"]');
+    }
+    const sheets = parseXMind(input.path, input.password);
+    // query is matched in searchIn (default: title, notes, labels, callouts); "tasks" in searchIn matches
+    // the task status text, or — without a query — every topic that has a task. taskStatus is a filter
+    // combined with the query (AND), never an alternative to it.
+    const searchFields = input.searchIn || ['title', 'notes', 'labels', 'callouts'];
     const caseSensitive = input.caseSensitive || false;
-    const searchQuery = input.query != null ? (caseSensitive ? input.query : input.query.toLowerCase()) : '';
+    const searchQuery = input.query != null ? (caseSensitive ? String(input.query) : String(input.query).toLowerCase()) : '';
+    const htmlText = html => String(html || '').replace(/<br\s*\/?>/gi, '\n').replace(/<[^<>]*>/g, '');
 
     function matchesText(text) {
         if (!text) return false;
@@ -1102,17 +1123,20 @@ function actionSearchNodes(input) {
         const matches = [];
 
         const matchedIn = [];
-        if (searchFields.includes('title') && matchesText(node.title)) matchedIn.push('title');
-        if (searchFields.includes('notes') && node.notes?.content && matchesText(node.notes.content)) matchedIn.push('notes');
-        if (searchFields.includes('labels') && node.labels?.some(l => matchesText(l))) matchedIn.push('labels');
-        if (searchFields.includes('callouts') && node.callouts?.some(c => matchesText(c.title))) matchedIn.push('callouts');
-        if (searchFields.includes('tasks') && node.taskStatus) matchedIn.push('tasks');
+        if (searchQuery !== '') {
+            if (searchFields.includes('title') && matchesText(node.title)) matchedIn.push('title');
+            if (searchFields.includes('notes') && (matchesText(node.notes?.content) || matchesText(htmlText(node.notes?.html)))) matchedIn.push('notes');
+            if (searchFields.includes('labels') && node.labels?.some(l => matchesText(l))) matchedIn.push('labels');
+            if (searchFields.includes('callouts') && node.callouts?.some(c => matchesText(c.title))) matchedIn.push('callouts');
+            if (searchFields.includes('tasks') && matchesText(node.taskStatus)) matchedIn.push('tasks');
+        } else if (searchFields.includes('tasks') && node.taskStatus) {
+            matchedIn.push('tasks');
+        }
 
-        const textMatched = searchQuery !== '' && matchedIn.length > 0;
-        const taskMatched = input.taskStatus && node.taskStatus === input.taskStatus;
-        // Task status filter: only include nodes that match, but always recurse into children
-        const taskExcluded = input.taskStatus && node.taskStatus && node.taskStatus !== input.taskStatus;
-        const shouldInclude = (textMatched || taskMatched) && !taskExcluded;
+        const textOk = searchQuery !== '' ? matchedIn.length > 0
+            : (input.taskStatus ? true : matchedIn.includes('tasks'));
+        const statusOk = !input.taskStatus || node.taskStatus === input.taskStatus;
+        const shouldInclude = textOk && statusOk;
 
         if (shouldInclude && node.id) {
             const match = {
@@ -1150,8 +1174,7 @@ function actionSearchNodes(input) {
 
 function actionFormatInfo(input) {
     if (!input.path) throw new Error('Missing "path"');
-    const buf = readFileSync(resolve(input.path));
-    const zip = openZip(buf);
+    const zip = openZip(readFileSync(resolve(input.path)), input.password);
     const names = zip.names();
     const hasJson = names.includes('content.json');
     const hasXml = names.includes('content.xml');
@@ -1180,170 +1203,33 @@ function actionFormatInfo(input) {
     };
 }
 
-// ─── validate: structural check against what XMind itself reads ───
-// Value lists below come from XMind 27's own renderer. No app is opened — the file is only parsed.
-const KNOWN = {
-    structure: new Set(['map', 'map.clockwise', 'map.anticlockwise', 'map.unbalanced', 'map.unbalanced.symmetric',
-        'map.floating', 'map.floating.clockwise', 'map.floating.anticlockwise', 'logic.right', 'logic.left',
-        'logic-chart.right', 'logic-chart.left', 'org-chart.down', 'org-chart.up', 'tree.right', 'tree.left',
-        'tree.right.btt', 'tree.left.btt', 'tree.branch-aligned.right', 'tree.branch-aligned.left',
-        'tree.branch-aligned.right.btt', 'tree.branch-aligned.left.btt', 'fishbone.leftHeaded', 'fishbone.rightHeaded',
-        'fishbone.leftHeaded.top', 'fishbone.leftHeaded.bottom', 'fishbone.rightHeaded.top', 'fishbone.rightHeaded.bottom',
-        'brace.right', 'brace.left', 'treetable', 'treetable.toptitle', 'treetable.righttitle', 'treetable.bottomtitle',
-        'spreadsheet', 'spreadsheet.column', 'grid', 'timeline.horizontal', 'timeline.horizontal.up',
-        'timeline.horizontal.down', 'timeline.horizontal.rtl', 'timeline.vertical', 'timeline.vertical.btt',
-        'timeline.sided.horizontal', 'timeline.sided.horizontal.rtl', 'timeline.through.vertical',
-        'timeline.through.vertical.btt', 'timeline.through.symmetric.vertical', 'timeline.through.symmetric.vertical.btt']
-        .map(x => `org.xmind.ui.${x}`)),
-    topicShape: new Set(['bookmark', 'callout', 'card', 'circle', 'cloud', 'curlyBracket', 'cutdiamond', 'data', 'database',
-        'decision', 'delay', 'diamond', 'document', 'doubleBookQuote', 'doubleQuote', 'doubleroundedangle', 'doubleunderline',
-        'ellipse', 'ellipserect', 'ellipticrectangle', 'fatLeftArrow', 'fatRightArrow', 'flag', 'handDrawnEllipse',
-        'handDrawnRect', 'handDrawnRoundedRect', 'handDrawnUnderline', 'heart', 'hexagon', 'label', 'leaf', 'manualInput',
-        'manualOperation', 'matrixMain', 'multiDocument', 'newcloud', 'noBorder', 'offPageReference', 'onPageReference',
-        'parallelogram', 'predefinedProcess', 'rect', 'roundBracket', 'roundedhexagon', 'roundedRect', 'shadowCard', 'shield',
-        'simpleCloud', 'singleBookQuote', 'singlebreakangle', 'singlebreakanglewithline', 'squareBracket', 'squareQuote',
-        'stack', 'star', 'trapezoid', 'treetable', 'underline', 'waterdrop'].map(x => `org.xmind.topicShape.${x}`)),
-    arrow: new Set(['antiTriangle', 'attached', 'diamond', 'dot', 'doublearrow', 'eye', 'herringbone', 'hook', 'none',
-        'normal', 'ring', 'spearhead', 'square', 'squarering', 'triangle'].map(x => `org.xmind.arrowShape.${x}`)),
-    branch: new Set(['arrowedCurve', 'bight', 'brace', 'curve', 'elbow', 'fold', 'none', 'roundedElbow', 'roundedfold',
-        'straight', 'timeline'].map(x => `org.xmind.branchConnection.${x}`)),
-    relationship: new Set(['angled', 'curved', 'flexible', 'quad', 'straight', 'threePoint', 'zigzag']
-        .map(x => `org.xmind.relationshipShape.${x}`)),
-    boundary: new Set(['cross', 'focus', 'newboundary', 'polygon', 'rect', 'roundedPolygon', 'roundedRect', 'scallops',
-        'tension', 'waves'].map(x => `org.xmind.boundaryShape.${x}`)),
-    summary: new Set(['angle', 'bracket', 'curly', 'fold', 'round', 'sharp', 'square', 'straight']
-        .map(x => `org.xmind.summaryShape.${x}`)),
-    markerPrefix: /^(task|priority|flag|star|half-star|people|smiley|arrow|month|week|tag|symbol|c_simbol|c_symbol|academic|social|celebration|other)[-_]/,
-};
-const COLOR_PROPS = ['svg:fill', 'fo:color', 'border-line-color', 'line-color', 'fo:background-color'];
-
+// ─── validate (lib/validate.mjs — also run by create_xmind.mjs after writing) ───
 function actionValidate(input) {
     if (!input.path) throw new Error('Missing "path"');
-    const errors = [], warnings = [];
-    const buf = readFileSync(resolve(input.path));
-    const zip = openZip(buf);
-    const names = new Set(zip.names());
-    const err = m => errors.push(m), warn = m => warnings.push(m);
-
-    if (!names.has('content.json')) {
-        if (!names.has('content.xml')) return { valid: false, format: 'unknown', errors: ['neither content.json nor content.xml found'], warnings };
-        validateLegacy(zip, names, err, warn);
-        return { valid: errors.length === 0, format: 'legacy', errors, warnings };
-    }
-    if (zip.encrypted && !PASSWORD) return { valid: null, format: 'zen', encrypted: true, passwordHint: zip.passwordHint,
-        errors: [], warnings: ['password-protected — pass "password" to validate the content'] };
-
-    let manifest = {};
-    try { manifest = JSON.parse(zip.extract('manifest.json')?.toString('utf-8') || '{}'); } catch { err('manifest.json is not valid JSON'); }
-    const listed = new Set(Object.keys(manifest['file-entries'] || {}));
-    for (const n of names) if (!n.endsWith('/') && !n.startsWith('__MACOSX/') && n !== 'manifest.json' && !listed.has(n) && n !== 'content.xml') warn(`${n} is in the zip but not in manifest.json`);
-    for (const n of listed) if (!names.has(n)) err(`manifest.json lists ${n}, which is missing from the zip`);
-
-    let sheets;
-    try {
-        const parsed = JSON.parse(zip.extract('content.json').toString('utf-8').replace(/^\uFEFF/, ''));
-        sheets = Array.isArray(parsed) ? parsed : parsed.sheets;
-    } catch (e) { return { valid: false, format: 'zen', errors: [`content.json: ${e.message}`], warnings }; }
-    if (!Array.isArray(sheets) || sheets.length === 0) err('content.json has no sheets');
-
-    const ids = new Set();
-    const checkXap = (v, where) => {
-        if (typeof v === 'string' && v.startsWith('xap:') && !names.has(v.slice(4))) err(`${where}: ${v} is not in the file`);
-    };
-    const checkStyle = (props, kind, where) => {
-        for (const [k, v] of Object.entries(props || {})) {
-            if (COLOR_PROPS.includes(k) && typeof v === 'string' && v !== 'none' && v !== 'inherited' && !/^#[0-9a-f]{3,8}$/i.test(v)) {
-                warn(`${where}: ${k} "${v}" is not a hex colour`);
-            }
-            if (k === 'shape-class') {
-                const set = kind === 'relationship' ? KNOWN.relationship : kind === 'boundary' ? KNOWN.boundary
-                    : kind === 'summary' ? KNOWN.summary : KNOWN.topicShape;
-                if (!set.has(v)) err(`${where}: unknown shape "${v}" (XMind draws its default instead)`);
-            }
-            if ((k === 'arrow-begin-class' || k === 'arrow-end-class') && v !== 'inherited' && !KNOWN.arrow.has(v)) err(`${where}: unknown arrow "${v}" (no arrow head is drawn)`);
-            if (k === 'line-class' && v !== 'inherited' && !KNOWN.branch.has(v)) err(`${where}: unknown branch line "${v}"`);
-        }
-    };
-
-    (sheets || []).forEach((sheet, si) => {
-        const sw = `sheet ${si + 1} "${sheet.title ?? ''}"`;
-        if (sheet.class !== 'sheet') warn(`${sw}: class should be "sheet"`);
-        if (!sheet.theme) warn(`${sw}: no theme object (XMind expects at least {})`);
-        const customMarkers = new Set((sheet.customMarkerGroups || []).flatMap(g => (g.markers || []).map(m => m.id)));
-        for (const g of sheet.customMarkerGroups || []) for (const m of g.markers || []) checkXap(m.resource, `${sw} custom marker ${m.id}`);
-        for (const e of sheet.extensions || []) for (const r of e.resources || []) checkXap(r, `${sw} ${e.provider}`);
-        const topicIds = new Set();
-        const walk = (t, path) => {
-            const w = `${sw} › ${path}`;
-            if (!t.id) err(`${w}: topic without id`);
-            else if (ids.has(t.id)) err(`${w}: duplicate id ${t.id}`);
-            ids.add(t.id); topicIds.add(t.id);
-            if (t.summary && !t.children?.summary) err(`${w}: summary topics are under "summary" — XMind only reads children.summary (they won't show)`);
-            if (t.structureClass && !KNOWN.structure.has(t.structureClass)) err(`${w}: unknown layout "${t.structureClass}"`);
-            checkStyle(t.style?.properties, 'topic', w);
-            checkXap(t.href, `${w} link`);
-            checkXap(t.image?.src, `${w} image`);
-            for (const m of t.markers || []) {
-                if (!KNOWN.markerPrefix.test(m.markerId) && !customMarkers.has(m.markerId)) warn(`${w}: marker "${m.markerId}" is neither a built-in nor a custom marker`);
-            }
-            const n = t.children?.attached?.length || 0;
-            for (const b of t.boundaries || []) {
-                const m = String(b.range).match(/^\((\d+),(\d+)\)$/);
-                if (b.range === 'master') { /* the whole branch */ } else if (!m) err(`${w}: boundary range "${b.range}" must look like "(0,2)" or "master"`);
-                else if (+m[2] >= n || +m[1] > +m[2]) err(`${w}: boundary range ${b.range} is outside its ${n} children`);
-                checkStyle(b.style?.properties, 'boundary', `${w} boundary`);
-            }
-            for (const sm of t.summaries || []) {
-                if (!(t.children?.summary || []).some(x => x.id === sm.topicId)) err(`${w}: summary ${sm.id} points to a missing summary topic`);
-                checkStyle(sm.style?.properties, 'summary', `${w} summary`);
-            }
-            for (const e of t.extensions || []) {
-                for (const r of e.resources || []) checkXap(r, `${w} ${e.provider}`);
-                if (e.provider === 'org.xmind.ui.webVideo' && (e.content?.url !== t.href || e.content?.thumbnail !== t.image?.src)) {
-                    warn(`${w}: web video url/thumbnail no longer match the topic's link/image — XMind won't show the player`);
-                }
-                if (e.provider === 'org.xmind.ui.mathJax' && !t.image?.isMathJaxImage) warn(`${w}: equation without its rendered image`);
-            }
-            for (const [kind, list] of Object.entries(t.children || {})) list.forEach((c, i) => walk(c, `${path} › ${c.title ?? `(${kind} ${i + 1})`}`));
-        };
-        if (!sheet.rootTopic) err(`${sw}: no rootTopic`); else walk(sheet.rootTopic, sheet.rootTopic.title ?? '(root)');
-        for (const r of sheet.relationships || []) {
-            if (!topicIds.has(r.end1Id) || !topicIds.has(r.end2Id)) err(`${sw}: relationship ${r.id} points to a topic that doesn't exist`);
-            checkStyle(r.style?.properties, 'relationship', `${sw} relationship "${r.title ?? r.id}"`);
-        }
-    });
-    // Second pass: dependency / internal-link targets across the whole workbook.
-    const walkAll = t => {
-        for (const e of t.extensions || []) for (const d of e.content?.dependencies || []) if (!ids.has(d.id)) err(`task "${t.title}": dependency on missing topic ${d.id}`);
-        if (typeof t.href === 'string' && t.href.startsWith('xmind:#') && !ids.has(t.href.slice(7))) warn(`"${t.title}": internal link to a missing topic`);
-        for (const list of Object.values(t.children || {})) list.forEach(walkAll);
-    };
-    (sheets || []).forEach(sh => sh.rootTopic && walkAll(sh.rootTopic));
-    return { valid: errors.length === 0, format: 'zen', encrypted: zip.encrypted, sheets: sheets?.length || 0, topics: ids.size, errors, warnings };
+    return validateBuffer(readFileSync(resolve(input.path)), { password: input.password });
 }
 
-function validateLegacy(zip, names, err, warn) {
-    const xml = zip.extract('content.xml').toString('utf-8');
-    if (/<topic[^>]*>\s*<title>[^<]*<\/title>\s*(<position[^>]*\/>\s*)?<style>/.test(xml)) {
-        err('topic styles are inline <style> elements — XMind 8 only reads styles.xml via style-id (they are ignored)');
+// ─── XMind's sticker / illustration library (read from the installed app, never started) ───
+const actionListStickers = input => listLibrary('sticker', input.query);
+const actionListIllustrations = input => listLibrary('illustration', input.query);
+
+// `output` of export / decrypt: an existing file is only replaced with "overwrite": true, and a
+// symlink there is replaced itself, never followed.
+function writeOutput(input, data, opts) {
+    const out = resolve(input.output);
+    let exists = false;
+    try { lstatSync(out); exists = true; } catch { /* new file */ }
+    if (exists && input.overwrite !== true) {
+        throw new Error(`"${input.output}" already exists. Nothing was written. Pass "overwrite": true to replace it, or choose another "output".`);
     }
-    const styleIds = [...xml.matchAll(/style-id="([^"]+)"/g)].map(m => m[1]);
-    if (styleIds.length > 0) {
-        if (!names.has('styles.xml')) err('style-id is used but styles.xml is missing');
-        else {
-            const sx = zip.extract('styles.xml').toString('utf-8');
-            for (const id of styleIds) if (!sx.includes(`id="${id}"`)) err(`style-id ${id} is not defined in styles.xml`);
-        }
-    }
-    for (const m of xml.matchAll(/xap:([^"]+)"/g)) if (!names.has(m[1])) err(`${m[1]} is referenced but missing`);
-    return {};
+    writeFileAtomicSync(out, data, { ...opts, follow: false });
 }
 
 // ─── export: Markdown / OPML / plain-text outline ───
 function actionExport(input) {
     if (!input.path) throw new Error('Missing "path"');
     const format = (input.format || 'markdown').toLowerCase();
-    const roots = parseXMind(input.path);
+    const roots = parseXMind(input.path, input.password);
     const sheetsWanted = input.sheet ? [roots[input.sheet - 1]].filter(Boolean) : roots;
     let out;
     if (format === 'markdown' || format === 'md') out = sheetsWanted.map(exportMarkdown).join('\n\n');
@@ -1351,29 +1237,37 @@ function actionExport(input) {
     else if (format === 'text' || format === 'txt') out = sheetsWanted.map(r => exportText(r, 0)).join('\n');
     else throw new Error(`Unknown export format "${input.format}". Use markdown, opml or text.`);
     if (input.output) {
-        writeFileSync(resolve(input.output), out);
+        // A protected map's outline is owner-only, like the decrypted copy.
+        writeOutput(input, out, input.password ? { mode: 0o600, forceMode: true } : {});
         return { written: resolve(input.output), format, bytes: Buffer.byteLength(out) };
     }
     return { format, content: out };
 }
 
-const plainNote = t => (t.notes?.content || (t.notes?.html || '').replace(/<br\s*\/?>/gi, '\n').replace(/<\/(p|li|div)>/gi, '\n').replace(/<[^>]+>/g, '')).trim();
+const plainNote = t => (t.notes?.content || (t.notes?.html || '').replace(/<br\s*\/?>/gi, '\n').replace(/<\/(p|li|div)>/gi, '\n').replace(/<[^<>]*>/g, '')).trim();
+// Map text is someone else's: in Markdown it stays text (no raw HTML, images, fake links or extra
+// lines), and only http(s) / mailto links are made clickable.
+const mdText = s => String(s ?? '').replace(/[\r\n\u2028\u2029]+/g, ' ').replace(/([\\`*_[\]<>|])/g, '\\$1').replace(/!(?=\\\[)/g, '\\!')
+    .replace(/^(\s*)([#>+=~-]|\d+[.)])/, '$1\\$2');  // no heading / quote / list started by the text itself
+const mdUrl = u => String(u).replace(/[\s()<>]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'));
 const mdTitle = t => {
-    let s = (t.title || (t.equation ? `$${t.equation}$` : '')).replace(/\n/g, ' ');
-    if (t.href && !t.href.startsWith('xap:') && !t.href.startsWith('xmind:')) s = `[${s || t.href}](${t.href})`;
-    if (t.labels?.length) s += ` *(${t.labels.join(', ')})*`;
+    // An equation stays LaTeX, inside a code span (nothing in it is rendered as Markdown or HTML).
+    let s = t.title ? mdText(t.title)
+        : t.equation ? `\`$${String(t.equation).replace(/[\r\n\u2028\u2029]+/g, ' ').replace(/`/g, "'")}$\`` : '';
+    if (t.href && /^(https?:|mailto:)/i.test(t.href)) s = `[${s || mdText(t.href)}](${mdUrl(t.href)})`;
+    if (t.labels?.length) s += ` *(${t.labels.map(mdText).join(', ')})*`;
     return s;
 };
 
 function exportMarkdown(root) {
-    const lines = [`# ${root.sheetTitle}`, '', `## ${mdTitle(root)}`];
+    const lines = [`# ${mdText(root.sheetTitle)}`, '', `## ${mdTitle(root)}`];
     const note = plainNote(root);
-    if (note) lines.push('', ...note.split('\n').map(l => `> ${l}`));
+    if (note) lines.push('', ...note.split(/\r?\n|\r/).map(l => `> ${mdText(l)}`));
     const walk = (t, depth) => {
         const box = t.taskStatus === 'done' ? '[x] ' : t.taskStatus === 'todo' ? '[ ] ' : '';
         lines.push(`${'  '.repeat(depth)}- ${box}${mdTitle(t)}`);
         const n = plainNote(t);
-        if (n) lines.push(...n.split('\n').map(l => `${'  '.repeat(depth + 1)}> ${l}`));
+        if (n) lines.push(...n.split(/\r?\n|\r/).map(l => `${'  '.repeat(depth + 1)}> ${mdText(l)}`));
         for (const c of t.children || []) walk(c, depth + 1);
     };
     lines.push('');
@@ -1403,41 +1297,9 @@ function exportText(t, depth) {
 }
 
 // ─── decrypt: write an unprotected copy (used by preview_xmind.py --password) ───
-const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
-    return c >>> 0;
-});
-function crc32(buf) {
-    let c = 0xFFFFFFFF;
-    for (const b of buf) c = CRC_TABLE[(c ^ b) & 0xFF] ^ (c >>> 8);
-    return (c ^ 0xFFFFFFFF) >>> 0;
-}
-function storedZip(entries) {
-    const locals = [], centrals = [];
-    let offset = 0;
-    for (const { name, data } of entries) {
-        const nameBuf = Buffer.from(name, 'utf-8'), crc = crc32(data);
-        const lh = Buffer.alloc(30);
-        lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(0x0800, 6);
-        lh.writeUInt32LE(crc, 14); lh.writeUInt32LE(data.length, 18); lh.writeUInt32LE(data.length, 22);
-        lh.writeUInt16LE(nameBuf.length, 26);
-        const ch = Buffer.alloc(46);
-        ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6); ch.writeUInt16LE(0x0800, 8);
-        ch.writeUInt32LE(crc, 16); ch.writeUInt32LE(data.length, 20); ch.writeUInt32LE(data.length, 24);
-        ch.writeUInt16LE(nameBuf.length, 28); ch.writeUInt32LE(offset, 42);
-        locals.push(lh, nameBuf, data); centrals.push(ch, nameBuf);
-        offset += 30 + nameBuf.length + data.length;
-    }
-    const cd = Buffer.concat(centrals), end = Buffer.alloc(22);
-    end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(entries.length, 8); end.writeUInt16LE(entries.length, 10);
-    end.writeUInt32LE(cd.length, 12); end.writeUInt32LE(offset, 16);
-    return Buffer.concat([...locals, cd, end]);
-}
-
 function actionDecrypt(input) {
     if (!input.path || !input.output) throw new Error('Missing "path" or "output"');
-    const zip = openZip(readFileSync(resolve(input.path)));
+    const zip = openZip(readFileSync(resolve(input.path)), input.password);
     if (!zip.encrypted) throw new Error('The file is not password-protected.');
     const entries = [];
     const manifest = { 'file-entries': {} };
@@ -1447,40 +1309,10 @@ function actionDecrypt(input) {
         manifest['file-entries'][name] = {};
     }
     entries.splice(Math.min(2, entries.length), 0, { name: 'manifest.json', data: Buffer.from(JSON.stringify(manifest)) });
-    writeFileSync(resolve(input.output), storedZip(entries));
+    // The decrypted copy is readable by its owner only.
+    writeOutput(input, buildZip(entries), { mode: 0o600, forceMode: true });
     return { written: resolve(input.output), entries: entries.length };
 }
-
-// ─── XMind's sticker / illustration library (read from the installed app, never started) ───
-function xmindAsarPath() {
-    return [process.env.XMIND_APP_ASAR, '/Applications/Xmind.app/Contents/Resources/app.asar',
-        `${process.env.HOME || ''}/Applications/Xmind.app/Contents/Resources/app.asar`,
-        `${process.env.LOCALAPPDATA || ''}/Programs/Xmind/resources/app.asar`, 'C:/Program Files/Xmind/resources/app.asar',
-        '/opt/Xmind/resources/app.asar', '/usr/lib/xmind/resources/app.asar'].filter(Boolean).find(p => existsSync(p));
-}
-
-function listLibrary(dir, filter) {
-    const path = xmindAsarPath();
-    if (!path) throw new Error('No XMind installation found (set XMIND_APP_ASAR to its app.asar). Stickers and illustrations come from XMind\'s own library.');
-    const buf = readFileSync(path);
-    const header = JSON.parse(buf.toString('utf-8', 16, 16 + buf.readUInt32LE(12)));
-    let node = header;
-    for (const part of dir.split('/')) node = node?.files?.[part];
-    const out = [];
-    const walk = (n, prefix) => {
-        for (const [name, child] of Object.entries(n?.files || {})) {
-            if (child.files) walk(child, `${prefix}${name}/`);
-            else if (/\.(svg|png)$/i.test(name)) out.push((prefix + name).replace(/\.(svg|png)$/i, ''));
-        }
-    };
-    walk(node, '');
-    const q = (filter || '').toLowerCase();
-    const items = q ? out.filter(n => n.toLowerCase().includes(q)) : out;
-    return { source: path, count: items.length, items };
-}
-
-const actionListStickers = input => listLibrary('static/snowbird/resource/stickers', input.query);
-const actionListIllustrations = input => listLibrary('static/snowbird/resource/illustrations', input.query);
 
 // ─── Main ───
 
@@ -1506,13 +1338,13 @@ async function main() {
 
     const input = JSON.parse(rawInput);
     if (!input.action) throw new Error('Missing "action" field');
-    if (typeof input.password === 'string') PASSWORD = input.password;
 
     const handler = actions[input.action];
     if (!handler) throw new Error(`Unknown action: "${input.action}". Valid: ${Object.keys(actions).join(', ')}`);
 
     const result = handler(input);
-    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    // Compact by default (half the tokens of pretty-printed JSON); "pretty": true for humans.
+    process.stdout.write(JSON.stringify(result, null, input.pretty ? 2 : 0) + '\n');
 }
 
 main().catch(err => {

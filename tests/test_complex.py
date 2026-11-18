@@ -17,11 +17,12 @@ Simulates real-world XMind 8 files with:
   - internal xmind:# links across sheets
   - folded branches
 """
-import json, subprocess, sys, os, zipfile, shutil, random, string
+import json, subprocess, sys, os, zipfile, shutil, random, string, tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_DIR = os.path.join(_HERE, "..", "skills", "xmind", "scripts")
-TEST_DIR   = "/tmp/xmind-complex-test"
+TEST_DIR   = tempfile.mkdtemp(prefix="xmind-complex-test-")
+import atexit; atexit.register(shutil.rmtree, TEST_DIR, True)
 
 def read_action(action_data):
     p = subprocess.run(
@@ -428,7 +429,7 @@ ckA.ok("root.timestamp", s1.get("timestamp") is not None, "timestamp present")
 ckA.ok("root.structureClass", s1.get("structureClass") is not None, "structureClass present")
 ckA.ok("root.styleId", s1.get("styleId") is not None, "styleId present")
 ckA.ok("root.shape", s1.get("shape") is not None, f"shape resolved from styles.xml: {s1.get('shape')}")
-ckA.ok("root.styleProperties", s1.get("styleProperties") is not None, "styleProperties present")
+ckA.ok("root.style", s1.get("style") is not None, "style present")
 ckA.ok("root.notes.plain", s1.get("notes",{}).get("content") is not None, "notes.plain present")
 ckA.ok("root.notes.html", s1.get("notes",{}).get("html") is not None, "notes.html present")
 ckA.ok("root.labels", len(s1.get("labels",[])) == 2, f"labels: {s1.get('labels')}")
@@ -451,8 +452,8 @@ if s1.get("extensions"):
     ckA.ok("custom_ext.content", ext.get("content",{}).get("category") is not None, f"category: {ext.get('content',{}).get('category')}")
     ckA.ok("custom_ext.owner", ext.get("content",{}).get("owner") is not None, f"owner: {ext.get('content',{}).get('owner')}")
 
-# Verify styleProperties from styles.xml
-sp = s1.get("styleProperties", {})
+# Verify style properties from styles.xml
+sp = s1.get("style", {})
 ckA.ok("style.font", "fo:font-family" in sp, f"font: {sp.get('fo:font-family')}")
 ckA.ok("style.size", "fo:font-size" in sp, f"size: {sp.get('fo:font-size')}")
 ckA.ok("style.color", "fo:color" in sp, f"color: {sp.get('fo:color')}")

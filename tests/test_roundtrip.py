@@ -9,11 +9,12 @@ Test matrix:
   4. Write legacy -> Read -> Write zen    -> Read -> Cross-compare
   5. Format detection (format_info action)
 """
-import json, subprocess, sys, os, shutil
+import json, subprocess, sys, os, shutil, tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_DIR = os.path.join(_HERE, "..", "skills", "xmind", "scripts")
-TEST_DIR   = "/tmp/xmind-version-test"
+TEST_DIR   = tempfile.mkdtemp(prefix="xmind-version-test-")
+import atexit; atexit.register(shutil.rmtree, TEST_DIR, True)
 
 # ── Helpers ──
 
@@ -359,7 +360,7 @@ def verify_search_actions(ck, path, fmt_name):
 def cross_compare(ck, data_a, data_b, label, skip_keys=None):
     """Deep compare two read results, ignoring IDs and specified keys."""
     skip = skip_keys or set()
-    skip.update({"id", "topicId", "end1Id", "end2Id", "styleProperties", "styleId"})
+    skip.update({"id", "topicId", "end1Id", "end2Id", "styleId"})
 
     def compare(a, b, path):
         if type(a) != type(b):

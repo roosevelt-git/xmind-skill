@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Test various real-world XMind file edge cases that could cause silent [] return"""
-import subprocess, json, struct, zlib, os
+import subprocess, json, struct, zlib, os, tempfile
+
+TMP = tempfile.mkdtemp(prefix="xmind-edge-test-")
+import atexit, shutil; atexit.register(shutil.rmtree, TMP, True)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_DIR = os.path.join(_HERE, "..", "skills", "xmind", "scripts")
@@ -70,7 +73,7 @@ print("=" * 70)
 # 1. content.json wrapped in object: {"sheets": [...]}
 print("\n--- Test 1: content.json as {sheets: [...]} object wrapper ---")
 content = {"sheets": [{"id":"s1","title":"Sheet","rootTopic":{"id":"t1","title":"Root","children":{"attached":[{"id":"t2","title":"Child"}]}}}]}
-path = '/tmp/edge1.xmind'
+path = os.path.join(TMP, 'edge1.xmind')
 with open(path, 'wb') as f:
     f.write(build_zip([('content.json', json.dumps(content).encode())]))
 out, err = run_read(path)
@@ -79,7 +82,7 @@ check("Object wrapper {sheets:[...]}", out, err, 1)
 # 2. content.json with BOM (byte order mark)
 print("\n--- Test 2: content.json with UTF-8 BOM ---")
 content_arr = [{"id":"s1","title":"Sheet","rootTopic":{"id":"t1","title":"Root","children":{"attached":[{"id":"t2","title":"Child"}]}}}]
-path = '/tmp/edge2.xmind'
+path = os.path.join(TMP, 'edge2.xmind')
 bom_json = b'\xef\xbb\xbf' + json.dumps(content_arr).encode('utf-8')
 with open(path, 'wb') as f:
     f.write(build_zip([('content.json', bom_json)]))
@@ -102,7 +105,7 @@ xml = '''<?xml version="1.0" encoding="UTF-8"?>
     </ns:topic>
   </ns:sheet>
 </ns:xmap-content>'''
-path = '/tmp/edge3.xmind'
+path = os.path.join(TMP, 'edge3.xmind')
 with open(path, 'wb') as f:
     f.write(build_zip([('content.xml', xml.encode())]))
 out, err = run_read(path)
@@ -131,7 +134,7 @@ xml = '''<?xml version="1.0" encoding="UTF-8"?>
     </topic>
   </sheet>
 </xmap-content>'''
-path = '/tmp/edge4.xmind'
+path = os.path.join(TMP, 'edge4.xmind')
 with open(path, 'wb') as f:
     f.write(build_zip([('content.xml', xml.encode())]))
 out, err = run_read(path)
@@ -146,7 +149,7 @@ xml = '''<?xml version="1.0" encoding="UTF-8"?>
     <topic id="t1"><title>Root</title></topic>
   </sheet>
 </workbook>'''
-path = '/tmp/edge5.xmind'
+path = os.path.join(TMP, 'edge5.xmind')
 with open(path, 'wb') as f:
     f.write(build_zip([('content.xml', xml.encode())]))
 out, err = run_read(path)
@@ -160,7 +163,7 @@ def make_deep(depth, i=0):
         topic["children"] = {"attached": [make_deep(depth-1, i+1)]}
     return topic
 content_arr = [{"id":"s1","title":"Deep","rootTopic": make_deep(20)}]
-path = '/tmp/edge6.xmind'
+path = os.path.join(TMP, 'edge6.xmind')
 with open(path, 'wb') as f:
     f.write(build_zip([('content.json', json.dumps(content_arr).encode())]))
 out, err = run_read(path)
@@ -169,7 +172,7 @@ check("20-level deep nesting", out, err, 21)
 # 7. content.xml with CRLF line endings
 print("\n--- Test 7: CRLF line endings in XML ---")
 xml = '<?xml version="1.0" encoding="UTF-8"?>\r\n<xmap-content xmlns="urn:xmind:xmap:xmlns:content:2.0">\r\n  <sheet id="s1">\r\n    <title>CRLF</title>\r\n    <topic id="t1">\r\n      <title>Root</title>\r\n      <children>\r\n        <topics type="attached">\r\n          <topic id="t2"><title>Child</title></topic>\r\n        </topics>\r\n      </children>\r\n    </topic>\r\n  </sheet>\r\n</xmap-content>'
-path = '/tmp/edge7.xmind'
+path = os.path.join(TMP, 'edge7.xmind')
 with open(path, 'wb') as f:
     f.write(build_zip([('content.xml', xml.encode())]))
 out, err = run_read(path)
@@ -231,7 +234,7 @@ xml = '''<?xml version="1.0" encoding="UTF-8" standalone="no"?>
     </relationships>
   </sheet>
 </xmap-content>'''
-path = '/tmp/edge8.xmind'
+path = os.path.join(TMP, 'edge8.xmind')
 with open(path, 'wb') as f:
     f.write(build_zip([
         ('content.xml', xml.encode()),
@@ -286,7 +289,7 @@ def make_stored_zip(entries):
         0x06054b50, 0, 0, len(entries), len(entries), len(cd_data), offset, 0)
     return b''.join(parts) + cd_data + eocd
 
-path = '/tmp/edge9.xmind'
+path = os.path.join(TMP, 'edge9.xmind')
 with open(path, 'wb') as f:
     f.write(make_stored_zip([('content.json', content_bytes)]))
 out, err = run_read(path)
@@ -295,7 +298,7 @@ check("Stored (uncompressed) ZIP", out, err, 1)
 # 10. ZIP with extra data before EOCD (e.g. archive comment)
 print("\n--- Test 10: ZIP with archive comment ---")
 content_arr = [{"id":"s1","title":"Comment","rootTopic":{"id":"t1","title":"Root"}}]
-path = '/tmp/edge10.xmind'
+path = os.path.join(TMP, 'edge10.xmind')
 zip_data = build_zip([('content.json', json.dumps(content_arr).encode())])
 # Append comment to EOCD
 comment = b'XMind created this file'

@@ -9,11 +9,13 @@ Everything happens offline from the file alone: XMind is never opened and the sc
 
 Usage:
     python3 preview_xmind.py FILE.xmind [--out-dir DIR] [--scale 0.5] [--sheet N]
-                             [--format png|pdf] [--password PW]
+                             [--format png|pdf] [--password-file FILE]
                              [--thumbnail]          # also embed sheet 1 as Thumbnails/thumbnail.png
 
-Requires Pillow (pip install pillow); --password also needs Node.js (decryption is done by
-read_xmind.mjs). Prints one line per sheet:
+Requires Pillow (pip install pillow); protected files also need Node.js (decryption is done by
+read_xmind.mjs). Give their password in a file (--password-file, or XMIND_PASSWORD_FILE) written
+with a file tool: other users on the machine can see command lines (ps), and so a --password
+argument or an XMIND_PASSWORD=… prefix typed into a shell command (both still work). Prints one line per sheet:
     <png path>  <width>x<height>  <warnings>
 """
 
@@ -26,6 +28,8 @@ import re
 import subprocess
 import sys
 import glob
+import shutil
+import signal
 import tempfile
 import unicodedata
 import zipfile
@@ -36,6 +40,14 @@ except ImportError:  # pragma: no cover
     sys.exit("preview_xmind.py needs Pillow: pip install pillow")
 
 PT = 1.333  # XMind sizes are in pt; 1pt ≈ 1.333px
+
+# Limits for files from someone else: a picture or a far-away topic must not need gigabytes.
+Image.MAX_IMAGE_PIXELS = 25_000_000      # embedded pictures (Pillow refuses larger ones)
+MAX_CANVAS_PIXELS = 25_000_000           # the drawing; bigger maps are drawn at a smaller scale
+MAX_CANVAS_SIDE = 16_000                 # … and no side longer than this
+MAX_PARTS = 40                           # readable pieces of a very large drawing
+MAX_FONT_PX = 400
+IMAGE_FORMATS = ["PNG", "JPEG", "GIF", "WEBP", "BMP"]
 
 FONT_CANDIDATES = {
     False: ["/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
@@ -111,7 +123,7 @@ def _scan_font(bold):
 
 
 def font(px, bold=False):
-    key = (max(6, round(px)), bold)
+    key = (min(MAX_FONT_PX, max(6, round(px))), bold)
     if key not in _fonts:
         path = _first(FONT_CANDIDATES[bold]) or _scan_font(bold) or _first(FONT_CANDIDATES[False]) or _scan_font(False)
         f = None
@@ -172,7 +184,18 @@ def _is_emoji(ch):
     return 0x1F000 <= o <= 0x1FAFF or 0x2600 <= o <= 0x27BF or o in (0x2B50, 0x2B55, 0x231B, 0x23F3)
 
 
+_glyph_cache = {}
+
+
 def _has_glyph(f, ch):
+    key = (id(f), ch)
+    hit = _glyph_cache.get(key)
+    if hit is None:
+        hit = _glyph_cache[key] = _has_glyph_uncached(f, ch)
+    return hit
+
+
+def _has_glyph_uncached(f, ch):
     # A missing glyph renders as the font's .notdef box; compare with a surely-missing codepoint.
     if ch.isspace():
         return True
@@ -237,7 +260,19 @@ def runs(text, f):
     return out
 
 
+_width_cache = {}
+
+
 def text_width(text, f):
+    if len(text) > 256:  # long strings aren't worth caching (and would fill memory)
+        return _text_width(text, f)
+    key = (id(f), text)
+    if key not in _width_cache:
+        _width_cache[key] = _text_width(text, f)
+    return _width_cache[key]
+
+
+def _text_width(text, f):
     w = 0
     for kind, s, use in runs(text, f):
         w += font_px(f) * 1.15 if kind == "emoji" else safe_length(use, s)
@@ -261,17 +296,30 @@ def draw_text(img, d, xy, text, f, color):
             x += safe_length(use, s)
 
 
+MAX_WRAP_CHARS, MAX_WRAP_LINES = 4000, 60
+
+
 def wrap(text, f, width):
-    """Greedy word wrap of one line to `width` px (used for customWidth and boundary titles)."""
-    words, lines, cur = text.split(" "), [], ""
-    for w in words:
-        trial = f"{cur} {w}".strip()
-        if cur and text_width(trial, f) > width:
-            lines.append(cur)
-            cur = w
+    """Greedy word wrap of one line to `width` px (used for customWidth and boundary titles).
+
+    Widths are added up word by word (linear in the text), and very long text is cut: a preview only
+    needs to show that a title is too long."""
+    if len(text) > MAX_WRAP_CHARS:
+        text = text[:MAX_WRAP_CHARS] + "…"
+    space = text_width(" ", f)
+    lines, cur, cur_w = [], [], 0.0
+    for w in text.split(" "):
+        ww = text_width(w, f)
+        if cur and cur_w + space + ww > width:
+            lines.append(" ".join(cur))
+            if len(lines) >= MAX_WRAP_LINES:
+                lines[-1] += " …"
+                return lines
+            cur, cur_w = [w], ww
         else:
-            cur = trial
-    lines.append(cur)
+            cur_w += (space if cur else 0) + ww
+            cur.append(w)
+    lines.append(" ".join(cur))
     return lines
 
 # ─── values ───
@@ -421,6 +469,16 @@ class Sheet:
         if ext(t, "org.xmind.ui.audionotes"):
             w += 22
         img = t.get("image")
+        if isinstance(img, dict) and img.get("src"):
+            # One size for measuring and drawing, bounded (a picture in XMind is at most a few
+            # thousand px): a missing or absurd width / height can't make the drawing huge.
+            def dim(v):
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    return 100.0
+                return min(max(v, 8.0), 2000.0) if math.isfinite(v) else 100.0
+            img = t["image"] = {**img, "width": dim(img.get("width")), "height": dim(img.get("height"))}
         if img and img.get("width"):
             align = img.get("align", "top")
             if align in ("left", "right"):
@@ -729,8 +787,11 @@ class Sheet:
         if name.lower().endswith(".svg"):
             return "svg"
         try:
-            return Image.open(io.BytesIO(data)).convert("RGBA")
-        except OSError:
+            return Image.open(io.BytesIO(data), formats=IMAGE_FORMATS).convert("RGBA")
+        except Image.DecompressionBombError:
+            self.warn(f"image too large to draw: {name}")
+            return None
+        except (OSError, ValueError):
             self.warn(f"image can't be decoded: {name}")
             return None
 
@@ -753,6 +814,14 @@ class Sheet:
         maxy = max(r[3] for r in rects) + 80
         S = scale
         W, H = int((maxx - minx) * S), int((maxy - miny) * S)
+        # Bounded in area and on each side (a topic far off in one direction would otherwise make a
+        # drawing millions of pixels wide and one pixel high).
+        side = max(W, H, 1)
+        if W * H > MAX_CANVAS_PIXELS or side > MAX_CANVAS_SIDE:
+            S *= min(math.sqrt(MAX_CANVAS_PIXELS / max(W * H, 1)), MAX_CANVAS_SIDE / side)
+            W, H = int((maxx - minx) * S), int((maxy - miny) * S)
+            self.warn("map is very large (or a topic is placed far away) — drawn at a reduced scale")
+        W, H = min(max(W, 1), MAX_CANVAS_SIDE), min(max(H, 1), MAX_CANVAS_SIDE)
         map_props = (self.theme.get("map") or {}).get("properties") or {}
         sheet_fill = ((self.sheet.get("style") or {}).get("properties") or {}).get("svg:fill")
         bg = hexc(sheet_fill or map_props.get("svg:fill"), "#FFFFFF") or (255, 255, 255)
@@ -1052,10 +1121,15 @@ class Sheet:
             label = "SVG image" if pic else "missing image"
             center_text(d, (x + w / 2, y + h / 2), label, font(11 * S), "#1864AB" if pic else "#C92A2A")
         else:
+            w, h = min(w, img.width), min(h, img.height)  # never larger than the drawing itself
             pic = pic.resize((max(1, int(w)), max(1, int(h))), Image.LANCZOS)
-            if spec.get("opacity") is not None:
-                a = pic.getchannel("A").point(lambda v: int(v * float(spec["opacity"])))
-                pic.putalpha(a)
+            try:
+                op = float(spec["opacity"]) if spec.get("opacity") is not None else None
+            except (TypeError, ValueError):
+                op = None
+            if op is not None and math.isfinite(op):
+                op = min(max(op, 0.0), 1.0)
+                pic.putalpha(pic.getchannel("A").point(lambda v: int(v * op)))
             img.paste(pic, (int(x), int(y)), pic)
         if video:
             cx, cy, r = x + w / 2, y + h / 2, min(w, h) * 0.18
@@ -1154,9 +1228,14 @@ class Sheet:
         layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
         f = font((wm.get("fontSize") or 36) * S, (wm.get("fontWeight") or 400) >= 600)
         col = hexc(wm.get("color"), "#868E96") or (134, 142, 150)
-        alpha = int(255 * float(wm.get("opacity", 0.15)))
-        tile = Image.new("RGBA", (int(text_width(wm["text"], f) + 40), int(font_px(f) * 1.6)), (0, 0, 0, 0))
-        ImageDraw.Draw(tile).text((20, 0), wm["text"] if is_truetype(f) else _latin1(wm["text"]), font=f, fill=(*col, alpha))
+        try:
+            alpha = int(255 * min(max(float(wm.get("opacity", 0.15)), 0.0), 1.0))
+        except (TypeError, ValueError):
+            alpha = 38
+        text = str(wm["text"])[:120]  # a watermark is a short line; the tile is at most the drawing's size
+        tw = min(int(text_width(text, f) + 40), max(img.width, 64))
+        tile = Image.new("RGBA", (tw, min(int(font_px(f) * 1.6), max(img.height, 64))), (0, 0, 0, 0))
+        ImageDraw.Draw(tile).text((20, 0), text if is_truetype(f) else _latin1(text), font=f, fill=(*col, alpha))
         tile = tile.rotate(-float(wm.get("rotationDegrees", -30)) * -1, expand=True)
         step = {"sparse": 2.2, "dense": 1.1}.get(wm.get("density"), 1.6)
         for x in range(0, img.size[0], max(1, int(tile.size[0] * step))):
@@ -1187,20 +1266,134 @@ class Sheet:
             draw_text(img, d, (x0 + 34 * S, yy), text, f, "#E9ECEF" if dark else "#343A40")
 
 
+PART_MAX = 2400  # px; a model sees larger images shrunk until text is unreadable
+
+
+# Outputs are written to an exclusive temp file and renamed into place: a symlink planted at the
+# output name is replaced, never followed. Previews of a protected map are owner-only.
+OUTPUT_MODE = 0o644
+
+
+def save_image(im, path, **kw):
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".preview-", suffix=os.path.splitext(path)[1], dir=d)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            im.save(fh, format="PDF" if path.lower().endswith(".pdf") else "PNG", **kw)
+            os.fchmod(fh.fileno(), OUTPUT_MODE)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def save_parts(img, base):
+    """Split a very large preview into overlapping readable parts (<base>-partN.png)."""
+    if img.width <= PART_MAX * 1.25 and img.height <= PART_MAX * 1.25:
+        return []
+    out, k, overlap = [], 1, 120
+    for y in range(0, img.height, PART_MAX - overlap):
+        for x in range(0, img.width, PART_MAX - overlap):
+            box = (x, y, min(x + PART_MAX, img.width), min(y + PART_MAX, img.height))
+            if k > MAX_PARTS:
+                return out
+            path = f"{base}-part{k}.png"
+            save_image(img.crop(box), path)
+            out.append(path)
+            k += 1
+            if box[2] >= img.width:
+                break
+        if y + PART_MAX >= img.height:
+            break
+    return out
+
+
 def embed_thumbnail(path, png_bytes):
-    with zipfile.ZipFile(path) as z:
+    path = os.path.realpath(path)  # update the real file behind a symlink, keep the link
+    mode = os.stat(path).st_mode & 0o7777
+    with open_zip(path) as z:
         files = {n: z.read(n) for n in z.namelist()}
     manifest = json.loads(files.get("manifest.json", b'{"file-entries":{}}'))
     manifest.setdefault("file-entries", {})["Thumbnails/thumbnail.png"] = {}
     files["Thumbnails/thumbnail.png"] = png_bytes
     files["manifest.json"] = json.dumps(manifest).encode()
     order = ["content.json", "metadata.json", "manifest.json"]
-    tmp = path + ".tmp"
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
-        for name in order + sorted(n for n in files if n not in order):
-            if name in files:
-                z.writestr(name, files[name])
-    os.replace(tmp, path)
+    # Exclusive, randomly named temp file next to the target: a planted "<file>.tmp" symlink can't
+    # redirect the write. Removed if anything fails.
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            with zipfile.ZipFile(fh, "w", zipfile.ZIP_DEFLATED) as z:
+                for name in order + sorted(n for n in files if n not in order):
+                    if name in files:
+                        z.writestr(name, files[name])
+            os.fchmod(fh.fileno(), mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+# Same limit as lib/zip.mjs: a hostile file can declare entries that inflate to gigabytes. zipfile
+# never inflates an entry past its declared size, so checking the declared total is enough.
+MAX_UNZIPPED_BYTES = (int(os.environ.get("XMIND_MAX_UNZIPPED_MB") or 0) or 1024) * 1024 * 1024
+BOMB_SIZE, BOMB_RATIO = 4 * 1024 * 1024, 100
+
+
+class SafeZipFile(zipfile.ZipFile):
+    """zipfile inflates an entry as far as its data goes, whatever size it declares; this one stops
+    one byte past the declared size, so a forged entry can't fill memory."""
+
+    def read(self, name, pwd=None):
+        info = name if isinstance(name, zipfile.ZipInfo) else self.getinfo(name)
+        out = bytearray()
+        with self.open(info, pwd=pwd) as f:
+            while True:
+                chunk = f.read(min(1 << 20, info.file_size + 1 - len(out)))
+                if not chunk:
+                    break
+                out += chunk
+                if len(out) > info.file_size:
+                    sys.exit(f'Invalid .xmind file: "{info.filename}" unpacks to more than its declared '
+                             f"{info.file_size} bytes (damaged or hostile file).")
+        return bytes(out)
+
+
+def open_zip(path):
+    zf = SafeZipFile(path)
+    custom = bool(os.environ.get("XMIND_MAX_UNZIPPED_MB"))
+    problem = None
+    for i in zf.infolist():
+        if i.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            # XMind writes stored / deflated entries only; others (bzip2, LZMA, zstd) would also slip
+            # past the ratio rule below.
+            problem = f"uses an unsupported compression method ({i.compress_type}) for {json.dumps(i.filename[:100])}"
+            break
+        if (not custom and i.compress_type == zipfile.ZIP_DEFLATED and i.file_size > BOMB_SIZE
+                and i.file_size > i.compress_size * BOMB_RATIO):
+            problem = (f'has an entry ("{i.filename}") that unpacks from {i.compress_size // 1024} KB '
+                       f"to {i.file_size // 1048576} MB")
+            break
+    spans = sorted(zf.infolist(), key=lambda i: i.header_offset)
+    for a, b in zip(spans, spans[1:]):
+        if a.header_offset + 30 + len(a.filename.encode()) + a.compress_size > b.header_offset:
+            problem = "has entries that overlap (damaged or hostile file)"
+    if len({i.filename for i in spans}) != len(spans):
+        problem = "lists the same entry twice (damaged or hostile file)"
+    total = sum(i.file_size for i in zf.infolist())
+    if not problem and total > MAX_UNZIPPED_BYTES:
+        problem = f"would unpack to {total // 1048576} MB, more than the {MAX_UNZIPPED_BYTES // 1048576} MB limit"
+    if problem:
+        zf.close()
+        sys.exit(f"This .xmind file {problem} — it is not a normal mind map "
+                 "(set XMIND_MAX_UNZIPPED_MB to raise the limit if you trust it).")
+    return zf
 
 
 def is_encrypted(zf):
@@ -1211,10 +1404,11 @@ def is_encrypted(zf):
     return any((e or {}).get("encryption-data") for e in (manifest.get("file-entries") or {}).values())
 
 
-def decrypted_copy(path, password):
-    """Decrypt via read_xmind.mjs (Python's standard library has no AES)."""
+def decrypted_copy(path, password, tmpdir):
+    """Decrypt via read_xmind.mjs (Python's standard library has no AES) into `tmpdir`, which the
+    caller deletes — the plaintext copy must never outlive the preview."""
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "read_xmind.mjs")
-    out = os.path.join(tempfile.mkdtemp(prefix="xmind-preview-"), "decrypted.xmind")
+    out = os.path.join(tmpdir, "decrypted.xmind")
     req = json.dumps({"action": "decrypt", "path": os.path.abspath(path), "password": password, "output": out})
     p = subprocess.run(["node", script], input=req, capture_output=True, text=True)
     if p.returncode != 0:
@@ -1223,13 +1417,28 @@ def decrypted_copy(path, password):
 
 
 def main():
+    # A kill (SIGTERM / SIGHUP) unwinds through the finally below, so the decrypted copy is removed.
+    for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if sig is not None:
+            signal.signal(sig, lambda *_: sys.exit(1))
+    tmpdir = tempfile.mkdtemp(prefix="xmind-preview-")  # private (0700); removed in every case
+    try:
+        run(tmpdir)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def run(tmpdir):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("file")
     ap.add_argument("--out-dir", default=None, help="where previews go (default: next to the file)")
     ap.add_argument("--scale", type=float, default=0.5)
     ap.add_argument("--sheet", type=int, default=None, help="1-based sheet number (default: all)")
     ap.add_argument("--format", choices=["png", "pdf"], default="png", help="pdf = one page per sheet")
-    ap.add_argument("--password", default=None, help="for password-protected files")
+    ap.add_argument("--password-file", default=None,
+                    help="file holding the password of a protected file (first line); safest")
+    ap.add_argument("--password", default=None,
+                    help="password of a protected file (visible to other users in ps — prefer --password-file)")
     ap.add_argument("--thumbnail", action="store_true", help="embed sheet 1 preview as the file thumbnail")
     a = ap.parse_args()
 
@@ -1241,19 +1450,30 @@ def main():
         scale = 1.0
         font_note = "no TrueType font found — text drawn with Pillow's basic font (install e.g. fonts-dejavu)"
     source = a.file
-    zf = zipfile.ZipFile(source)
+    pw_file = a.password_file or os.environ.get("XMIND_PASSWORD_FILE")
+    if pw_file:
+        with open(pw_file, encoding="utf-8") as fh:
+            password = fh.readline().rstrip("\r\n") or None
+    else:
+        password = a.password or os.environ.get("XMIND_PASSWORD") or None
+    zf = open_zip(source)
     if "content.json" not in zf.namelist():
         sys.exit("Only modern (zen) .xmind files can be previewed (no content.json found).")
     if is_encrypted(zf):
-        if not a.password:
-            sys.exit("This file is password-protected — pass --password.")
+        if not password:
+            sys.exit("This file is password-protected — pass --password-file (a file holding the password).")
         if a.thumbnail:
             sys.exit("--thumbnail is not available for password-protected files (it would reveal the map).")
+        global OUTPUT_MODE
+        OUTPUT_MODE = 0o600  # previews show the protected map in clear: owner-only
         zf.close()
-        source = decrypted_copy(a.file, a.password)
-        zf = zipfile.ZipFile(source)
+        source = decrypted_copy(a.file, password, tmpdir)
+        zf = open_zip(source)
     content = json.loads(zf.read("content.json").decode("utf-8-sig"))
     sheets = content if isinstance(content, list) else content.get("sheets", [])
+    if len(sheets) > 50 and not a.sheet:
+        print(f"note: {len(sheets)} sheets — only the first 50 are drawn (use --sheet N for others)")
+        sheets = sheets[:50]
     out_dir = a.out_dir or os.path.dirname(os.path.abspath(a.file))
     os.makedirs(out_dir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(a.file))[0]
@@ -1268,8 +1488,14 @@ def main():
         warn = "; ".join(dict.fromkeys(s.warnings)) or "ok"
         if a.format == "png":
             out = os.path.join(out_dir, f"{stem}-sheet{i}.png")
-            img.save(out)
+            save_image(img, out)
+            parts = save_parts(img, os.path.join(out_dir, f"{stem}-sheet{i}"))
+            if parts:
+                warn = (warn + "; " if warn != "ok" else "") + \
+                    f"map is {img.width}x{img.height}px — too big to read as one image; look at the {len(parts)} parts"
             print(f"{out}  {img.width}x{img.height}  {warn}")
+            for part in parts:
+                print(f"  part: {part}")
         else:
             pages.append(img)
             print(f"sheet {i}  {img.width}x{img.height}  {warn}")
@@ -1282,7 +1508,7 @@ def main():
     zf.close()
     if pages:
         out = os.path.join(out_dir, f"{stem}.pdf")
-        pages[0].save(out, "PDF", save_all=True, append_images=pages[1:], resolution=96)
+        save_image(pages[0], out, save_all=True, append_images=pages[1:], resolution=96)
         print(f"{out}  {len(pages)} page(s)")
     if a.thumbnail:
         if thumb is None:
@@ -1292,4 +1518,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except zipfile.BadZipFile as err:
+        sys.exit(f"Invalid .xmind file (damaged ZIP): {err}")
+    except Image.DecompressionBombError:
+        sys.exit("This map would need a drawing too large to render safely — it is not a normal mind map.")

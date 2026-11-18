@@ -5,175 +5,92 @@
 // Or:   node create_xmind.mjs --path /tmp/test.xmind < data.json
 // No external dependencies — uses only Node.js built-ins.
 
-import { mkdir, writeFile, readFile } from 'fs/promises';
+import { mkdir, readFile } from 'fs/promises';
 import { existsSync, readFileSync } from 'fs';
-import { dirname, resolve, extname } from 'path';
-import { randomUUID, createHash, randomBytes, pbkdf2Sync, createCipheriv, createDecipheriv } from 'crypto';
-import { deflateRawSync, inflateRawSync } from 'zlib';
+import { dirname, resolve, extname, basename, join } from 'path';
+import { createHash } from 'crypto';
+import { buildZip, readZip } from './lib/zip.mjs';
+import { encryptEntry, openZip, PASSWORD_REQUIRED, WRONG_PASSWORD } from './lib/crypto.mjs';
+import { libraryAsset } from './lib/asar.mjs';
+import { latexToSvg, escapeSvg } from './lib/latex.mjs';
+import { buildLegacy, buildLegacyMeta, buildLegacyManifest } from './lib/legacy-writer.mjs';
+import { generateId, quoteHint, writeFileAtomicSync } from './lib/util.mjs';
+import { validateBuffer } from './lib/validate.mjs';
+import * as K from './lib/known.mjs';
 
-// ─── Minimal ZIP writer (PKZIP APPNOTE 6.3.3) ───
+const { BRANCH_LINES, ARROW_ALIASES, FILL_PATTERNS, NUMBERING } = K;
+const ARROWS = new Set(K.ARROWS);
+const LINE_PATTERNS = new Set(K.LINE_PATTERNS);
+const STROKE_PATTERNS = new Set(K.STROKE_PATTERNS);
+const TEXT_TRANSFORMS = new Set(K.TEXT_TRANSFORMS);
+const TEXT_ALIGNS = new Set(K.TEXT_ALIGNS);
+const IMAGE_ALIGNS = new Set(K.IMAGE_ALIGNS);
+const BOUNDARY_SHAPES = new Set(K.BOUNDARY_SHAPES);
+const SUMMARY_SHAPES = new Set(K.SUMMARY_SHAPES);
+const TASK_STATUSES = new Set(K.TASK_STATUSES);
+export const VERSION = '4.0.0';
 
-function crc32(buf) {
-    let crc = 0xFFFFFFFF;
-    for (let i = 0; i < buf.length; i++) {
-        crc ^= buf[i];
-        for (let j = 0; j < 8; j++) crc = (crc >>> 1) ^ (crc & 1 ? 0xEDB88320 : 0);
+// A layout / shape value: the full XMind class, or its short form ("logic.right", "diamond").
+// Unknown values are rejected — XMind would silently draw its default instead.
+function xmindClass(value, prefix, known, field, where) {
+    const full = String(value).startsWith(prefix) ? String(value) : prefix + value;
+    if (!known.has(full)) {
+        const names = [...known].map(n => n.slice(prefix.length));
+        const near = names.filter(n => n.toLowerCase().includes(String(value).replace(prefix, '').toLowerCase().slice(0, 4))).slice(0, 6);
+        throw new Error(`${where}: unknown ${field} "${value}"` + (near.length ? ` — did you mean ${near.join(', ')}?` : '') +
+            ` (all values are listed in lib/known.mjs).`);
     }
-    return (crc ^ 0xFFFFFFFF) >>> 0;
+    return full;
 }
 
-function buildZip(files) {
-    // files: Array<{name: string, data: Buffer}>
-    const entries = [];
-    const centralHeaders = [];
-    let offset = 0;
-
-    for (const { name, data } of files) {
-        const nameBytes = Buffer.from(name, 'utf-8');
-        const compressed = deflateRawSync(data);
-        const crc = crc32(data);
-
-        // Local file header (30 + nameLen + compressedLen)
-        const localHeader = Buffer.alloc(30);
-        localHeader.writeUInt32LE(0x04034b50, 0);  // signature
-        localHeader.writeUInt16LE(20, 4);            // version needed
-        localHeader.writeUInt16LE(0, 6);             // flags
-        localHeader.writeUInt16LE(8, 8);             // compression: deflate
-        localHeader.writeUInt16LE(0, 10);            // mod time
-        localHeader.writeUInt16LE(0, 12);            // mod date
-        localHeader.writeUInt32LE(crc, 14);          // crc-32
-        localHeader.writeUInt32LE(compressed.length, 18);  // compressed size
-        localHeader.writeUInt32LE(data.length, 22);        // uncompressed size
-        localHeader.writeUInt16LE(nameBytes.length, 26);   // file name length
-        localHeader.writeUInt16LE(0, 28);            // extra field length
-
-        const entry = Buffer.concat([localHeader, nameBytes, compressed]);
-        entries.push(entry);
-
-        // Central directory header
-        const cdHeader = Buffer.alloc(46);
-        cdHeader.writeUInt32LE(0x02014b50, 0);   // signature
-        cdHeader.writeUInt16LE(20, 4);             // version made by
-        cdHeader.writeUInt16LE(20, 6);             // version needed
-        cdHeader.writeUInt16LE(0, 8);              // flags
-        cdHeader.writeUInt16LE(8, 10);             // compression: deflate
-        cdHeader.writeUInt16LE(0, 12);             // mod time
-        cdHeader.writeUInt16LE(0, 14);             // mod date
-        cdHeader.writeUInt32LE(crc, 16);           // crc-32
-        cdHeader.writeUInt32LE(compressed.length, 20);
-        cdHeader.writeUInt32LE(data.length, 24);
-        cdHeader.writeUInt16LE(nameBytes.length, 28);
-        cdHeader.writeUInt16LE(0, 30);             // extra field length
-        cdHeader.writeUInt16LE(0, 32);             // comment length
-        cdHeader.writeUInt16LE(0, 34);             // disk number
-        cdHeader.writeUInt16LE(0, 36);             // internal attrs
-        cdHeader.writeUInt32LE(0, 38);             // external attrs
-        cdHeader.writeUInt32LE(offset, 42);        // local header offset
-
-        centralHeaders.push(Buffer.concat([cdHeader, nameBytes]));
-        offset += entry.length;
+// ISO 8601 dates ("2026-02-01", "2026-02-01T09:00:00Z") or epoch milliseconds; anything else is an error
+// (a silently invalid date would show up in XMind as 1 January 1970).
+function taskDate(value, field, where) {
+    const t = typeof value === 'number' ? value
+        : /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/.test(String(value).trim()) ? Date.parse(value) : NaN;
+    if (!Number.isFinite(t)) {
+        throw new Error(`${where}: ${field} ${JSON.stringify(value)} is not a valid date — use ISO 8601, e.g. "2026-02-01" or "2026-02-01T09:00:00Z".`);
     }
-
-    const centralDir = Buffer.concat(centralHeaders);
-
-    // End of central directory record
-    const eocd = Buffer.alloc(22);
-    eocd.writeUInt32LE(0x06054b50, 0);
-    eocd.writeUInt16LE(0, 4);                          // disk number
-    eocd.writeUInt16LE(0, 6);                          // disk with CD
-    eocd.writeUInt16LE(files.length, 8);               // entries on disk
-    eocd.writeUInt16LE(files.length, 10);              // total entries
-    eocd.writeUInt32LE(centralDir.length, 12);         // CD size
-    eocd.writeUInt32LE(offset, 16);                    // CD offset
-    eocd.writeUInt16LE(0, 20);                         // comment length
-
-    return Buffer.concat([...entries, centralDir, eocd]);
-}
-
-// ─── Minimal ZIP reader (ported from read_xmind.mjs) — used to preserve theme/style/resources
-// when overwriting a file that already exists, so re-running create_xmind.mjs on an existing
-// .xmind never silently resets its visual theme, layout extensions, or embedded thumbnail. ───
-
-function readZip(buf) {
-    let eocdOffset = -1;
-    for (let i = buf.length - 22; i >= 0; i--) {
-        if (buf.readUInt32LE(i) === 0x06054b50) {
-            eocdOffset = i;
-            break;
-        }
-    }
-    if (eocdOffset === -1) throw new Error('Invalid ZIP: EOCD not found');
-
-    const cdEntries = buf.readUInt16LE(eocdOffset + 10);
-    const cdOffset = buf.readUInt32LE(eocdOffset + 16);
-
-    const files = new Map();
-    let pos = cdOffset;
-    for (let i = 0; i < cdEntries; i++) {
-        if (buf.readUInt32LE(pos) !== 0x02014b50) throw new Error('Invalid ZIP: bad CD entry');
-        const compression = buf.readUInt16LE(pos + 10);
-        const compressedSize = buf.readUInt32LE(pos + 20);
-        const nameLen = buf.readUInt16LE(pos + 28);
-        const extraLen = buf.readUInt16LE(pos + 30);
-        const commentLen = buf.readUInt16LE(pos + 32);
-        const localHeaderOffset = buf.readUInt32LE(pos + 42);
-        const name = buf.toString('utf-8', pos + 46, pos + 46 + nameLen);
-
-        files.set(name, { compression, compressedSize, localHeaderOffset });
-        pos += 46 + nameLen + extraLen + commentLen;
-    }
-
-    return {
-        extract(name) {
-            const entry = files.get(name);
-            if (!entry) return null;
-            const lhOffset = entry.localHeaderOffset;
-            if (buf.readUInt32LE(lhOffset) !== 0x04034b50) throw new Error('Invalid ZIP: bad local header');
-            const lhNameLen = buf.readUInt16LE(lhOffset + 26);
-            const lhExtraLen = buf.readUInt16LE(lhOffset + 28);
-            const dataOffset = lhOffset + 30 + lhNameLen + lhExtraLen;
-            const rawData = buf.subarray(dataOffset, dataOffset + entry.compressedSize);
-            if (entry.compression === 0) return rawData;
-            if (entry.compression === 8) return inflateRawSync(rawData);
-            throw new Error(`Unsupported compression method: ${entry.compression}`);
-        },
-        names() { return [...files.keys()]; },
-    };
+    return t;
 }
 
 // Reads an existing .xmind file (if any) at `path` so its per-sheet theme/extensions and
 // embedded resources (e.g. Thumbnails/thumbnail.png) can be carried into the regenerated file.
 // Returns null if there's nothing to preserve (file doesn't exist, isn't zen-format, or fails to parse) —
 // callers must treat that as "nothing to merge", not an error.
-// Decrypt an entry written with XMind's password scheme (see encryptEntry); returns it unchanged
-// when the manifest says it isn't encrypted.
-function decryptEntry(data, meta, password) {
-    const enc = meta?.['encryption-data'];
-    if (!enc) return data;
-    if (!password) throw new Error('the file is password-protected — pass "password"');
-    const keyLen = (Number(enc.size) || 128) / 8;
-    const key = pbkdf2Sync(Buffer.from(password, 'utf-8'), Buffer.from(enc.salt, 'base64'),
-        Number(enc['iteration-count']) || 1024, keyLen, 'sha512');
-    const iv = enc.iv ? Buffer.from(enc.iv, 'base64') : Buffer.alloc(16);
-    try {
-        const d = createDecipheriv(`aes-${keyLen * 8}-cbc`, key, iv);
-        return Buffer.concat([d.update(data), d.final()]);
-    } catch {
-        throw new Error('wrong password');
+// A file that exists but can't be read (damaged, not a zip, over the size limits) is not replaced
+// unless "overwrite": true — it may be a protected or valuable file the reader refused.
+function unreadable(path, reason, overwrite) {
+    if (overwrite) {
+        console.error(`Warning: "${path}" could not be read (${reason}); replacing it because "overwrite" is true.`);
+        return null;
     }
+    throw new Error(`"${path}" exists but could not be read as an XMind file (${reason}). Nothing was written. ` +
+        'Pass "overwrite": true to replace it anyway, or choose another "path".');
 }
 
-async function loadExistingXMind(path, password = null) {
+async function loadExistingXMind(path, password = null, { overwrite = false } = {}) {
     if (!existsSync(path)) return null;
+    let zip;
     try {
-        const buf = await readFile(path);
-        const raw = readZip(buf);
-        const manifestEntries = raw.names().includes('manifest.json')
-            ? JSON.parse(raw.extract('manifest.json').toString('utf-8'))['file-entries'] || {} : {};
-        const zip = { names: () => raw.names(),
-            extract: n => { const d = raw.extract(n); return d && decryptEntry(d, manifestEntries[n], password); } };
+        zip = openZip(await readFile(path), password);
+    } catch (err) {
+        return unreadable(path, err.message, overwrite);
+    }
+    try {
         const names = zip.names();
-        if (!names.includes('content.json')) return null;
+        const legacy = !names.includes('content.json');
+        if (legacy && !names.includes('content.xml')) return unreadable(path, 'a ZIP file without a mind map in it', overwrite);
+        if (legacy && !/<xmap-content[\s>]/.test(zip.extract('content.xml').toString('utf-8', 0, 4096))) {
+            return unreadable(path, 'its content.xml is not an XMind 8 map', overwrite);
+        }
+        if (legacy) {
+            // XMind 8 file: no theme/styles to merge, but its embedded images and attachments can be
+            // referenced again (read → create keeps "xap:" sources).
+            const resourceEntries = names.filter(n => /^(resources|attachments)\//.test(n) && !n.endsWith('/'))
+                .map(name => ({ name, data: zip.extract(name) }));
+            return { sheetsByTitle: new Map(), metadataRaw: null, resourceEntries, encrypted: false, legacy: true };
+        }
 
         const parsedContent = JSON.parse(zip.extract('content.json').toString('utf-8'));
         // Accept both array format and {sheets:[...]} object wrapper (read_xmind.mjs does the same).
@@ -194,15 +111,22 @@ async function loadExistingXMind(path, password = null) {
 
         const resourceEntries = [];
         for (const name of names) {
-            if (name === 'content.json' || name === 'metadata.json' || name === 'manifest.json') continue;
+            if (['content.json', 'metadata.json', 'manifest.json', 'content.xml', 'meta.xml', 'styles.xml',
+                'META-INF/manifest.xml'].includes(name)) continue;
             if (name.endsWith('/')) continue; // directory marker entry, nothing to carry forward
             resourceEntries.push({ name, data: zip.extract(name) });
         }
 
-        return { sheetsByTitle, metadataRaw, resourceEntries };
+        return { sheetsByTitle, metadataRaw, resourceEntries, encrypted: zip.encrypted, passwordHint: zip.passwordHint };
     } catch (err) {
-        console.error(`Warning: could not read existing file "${path}" to preserve its theme/style (${err.message}). Proceeding without merge.`);
-        return null;
+        // Never overwrite a protected file we couldn't open: that would silently drop its password
+        // (and its styling). The caller stops with this error and leaves the file untouched.
+        if (err.code === PASSWORD_REQUIRED || err.code === WRONG_PASSWORD) {
+            throw new Error(`${path} is password-protected and ${err.code === WRONG_PASSWORD ? 'the password is wrong' : 'no "password" was given'}` +
+                `${quoteHint(zip.passwordHint)}. Nothing was written. Pass its "password" to update it ` +
+                '(it stays protected); to save it without protection on purpose, also pass "removePassword": true.');
+        }
+        return unreadable(path, err.message, overwrite);
     }
 }
 
@@ -230,27 +154,6 @@ const PALETTE = {
     navy:   { fill: '#1E3A5F', border: '#1E3A5F', text: '#FFFFFF' },
     white:  { fill: '#FFFFFF', border: '#868E96', text: DARK_TEXT },
 };
-
-// Values below are the ones XMind (27.x) itself knows — checked against its bundled renderer.
-const BRANCH_LINES = {
-    curve: 'org.xmind.branchConnection.curve',
-    straight: 'org.xmind.branchConnection.straight',
-    elbow: 'org.xmind.branchConnection.elbow',
-    roundedElbow: 'org.xmind.branchConnection.roundedElbow',
-    fold: 'org.xmind.branchConnection.fold',
-    roundedFold: 'org.xmind.branchConnection.roundedfold',
-    bight: 'org.xmind.branchConnection.bight',
-    arrowedCurve: 'org.xmind.branchConnection.arrowedCurve',
-    none: 'org.xmind.branchConnection.none',
-};
-
-const ARROWS = new Set(['none', 'triangle', 'normal', 'spearhead', 'antiTriangle', 'dot', 'ring', 'square',
-    'squarering', 'diamond', 'herringbone', 'hook', 'eye', 'doublearrow', 'attached']);
-// Earlier versions of this skill documented "antTriangle", which XMind ignores (no arrow head).
-const ARROW_ALIASES = { antTriangle: 'antiTriangle' };
-
-const LINE_PATTERNS = new Set(['solid', 'dash', 'dot', 'dash-dot', 'dash-dot-dot', 'handdrawn-solid', 'handdrawn-dash',
-    'handdrawn-dot', 'handdrawn-dash-dot', 'handdrawn-dash-dot-dot']);
 
 function toPt(v) {
     if (v === undefined || v === null) return undefined;
@@ -314,13 +217,6 @@ const TOPIC_STYLE_PROPS = {
     handDrawn: ['fill-pattern', 'border-line-pattern', 'line-pattern'],
 };
 
-// Line patterns XMind stores for branches, borders, boundaries and relationships; the hand-drawn
-// ones are what its "hand-drawn" themes use.
-const STROKE_PATTERNS = new Set(['solid', 'dash', 'dot', 'dash-dot', 'dash-dot-dot', 'handdrawn-solid',
-    'handdrawn-dash', 'handdrawn-dot', 'handdrawn-dash-dot', 'handdrawn-dash-dot-dot', 'none']);
-const FILL_PATTERNS = { solid: 'solid', none: 'none', handDrawn: 'solid-hand-drawn', 'solid-hand-drawn': 'solid-hand-drawn' };
-const TEXT_TRANSFORMS = new Set(['manual', 'uppercase', 'lowercase', 'capitalize']);
-const TEXT_ALIGNS = new Set(['left', 'center', 'right']);
 
 function oneOf(value, allowed, field, where) {
     if (!allowed.has(value)) throw new Error(`${where}: unknown ${field} "${value}". Use: ${[...allowed].join(', ')}`);
@@ -342,7 +238,7 @@ function topicStyleProps(input, where = `topic "${input.title}"`) {
     for (const [key, props] of Object.entries(TOPIC_STYLE_PROPS)) {
         if (input[key] === null) for (const prop of props) p[prop] = null;
     }
-    if (input.shape != null) p['shape-class'] = input.shape;
+    if (input.shape != null) p['shape-class'] = xmindClass(input.shape, 'org.xmind.topicShape.', K.KNOWN.topicShape, 'shape', where);
     if (input.color != null) {
         const c = resolveColor(input.color, where);
         p['svg:fill'] = c.fill;
@@ -394,7 +290,7 @@ function topicStyleProps(input, where = `topic "${input.title}"`) {
 
 function relationshipStyleProps(rel, where = 'relationship') {
     const p = {};
-    if (rel.shape) p['shape-class'] = rel.shape;
+    if (rel.shape) p['shape-class'] = xmindClass(rel.shape, 'org.xmind.relationshipShape.', K.KNOWN.relationship, 'relationship shape', where);
     if (rel.color != null) p['line-color'] = lineColor(rel.color, where);
     if (rel.width != null) p['line-width'] = toPt(rel.width);
     if (rel.pattern) {
@@ -414,8 +310,6 @@ function relationshipStyleProps(rel, where = 'relationship') {
     return Object.keys(p).length > 0 ? p : null;
 }
 
-// numberChildren values → XMind's numbering patterns (the "1." / "A." / "a." / "I." menu).
-const NUMBERING = { arabic: 'numeral-arabic', upper: 'alphabet-uppercase', lower: 'alphabet-lowercase', roman: 'numeral-roman' };
 
 function numberingContent(spec, where) {
     const o = typeof spec === 'string' ? { pattern: spec } : (spec === true ? { pattern: 'arabic' } : spec);
@@ -426,9 +320,6 @@ function numberingContent(spec, where) {
     return { pattern: NUMBERING[o.pattern], tiered: !!o.tiered };
 }
 
-const BOUNDARY_SHAPES = new Set(['roundedRect', 'rect', 'scallops', 'waves', 'tension', 'polygon',
-    'roundedPolygon', 'cross', 'focus', 'newboundary']);
-const SUMMARY_SHAPES = new Set(['round', 'square', 'curly', 'bracket', 'angle', 'sharp', 'straight', 'fold']);
 
 // Style of a boundary or summary bracket: {shape?, fill?, lineColor?, lineWidth?, pattern?, style?}.
 // `style` may be raw properties or XMind's {properties} object (as read_xmind.mjs returns it).
@@ -569,7 +460,7 @@ function themeSlotProps(slot, spec) {
 function themeFromFile(path, sheetNumber = 1) {
     const where = `theme.from "${path}"`;
     if (!existsSync(resolve(path))) throw new Error(`${where}: file not found.`);
-    const zip = readZip(readFileSync(resolve(path)));
+    const zip = openZip(readFileSync(resolve(path)));
     const raw = zip.extract('content.json');
     if (!raw) throw new Error(`${where}: only modern (zen) .xmind files carry a theme.`);
     const parsed = JSON.parse(raw.toString('utf-8').replace(/^\uFEFF/, ''));
@@ -653,7 +544,6 @@ function svgSize(head) {
     return null;
 }
 
-const IMAGE_ALIGNS = new Set(['top', 'bottom', 'left', 'right']);
 
 // Image keys XMind reads from content.json besides src / width / height.
 function imageExtras(opts, where) {
@@ -811,260 +701,7 @@ function zenOnlyFeatures(input) {
     return [...found];
 }
 
-// ─── Rich content: XMind's own sticker library, equations, video, audio ───
-
-// XMind ships ~470 stickers and illustration packs inside its app bundle (app.asar). When XMind is
-// installed they can be embedded like any other image — exactly what XMind does when the user picks
-// one. Only files are read; the app is never started. XMIND_APP_ASAR overrides the location.
-const XMIND_ASAR_CANDIDATES = [
-    process.env.XMIND_APP_ASAR,
-    '/Applications/Xmind.app/Contents/Resources/app.asar',
-    `${process.env.HOME || ''}/Applications/Xmind.app/Contents/Resources/app.asar`,
-    `${process.env.LOCALAPPDATA || ''}/Programs/Xmind/resources/app.asar`,
-    'C:/Program Files/Xmind/resources/app.asar',
-    '/opt/Xmind/resources/app.asar',
-    '/usr/lib/xmind/resources/app.asar',
-].filter(Boolean);
-
-let asarCache;
-function xmindAsar() {
-    if (asarCache !== undefined) return asarCache;
-    asarCache = null;
-    for (const path of XMIND_ASAR_CANDIDATES) {
-        if (!existsSync(path)) continue;
-        try {
-            const fd = readFileSync(path, { flag: 'r' }).subarray(0, 16);
-            const headerSize = fd.readUInt32LE(12);
-            const buf = readFileSync(path);
-            const header = JSON.parse(buf.toString('utf-8', 16, 16 + headerSize));
-            asarCache = { path, buf, header, base: 8 + buf.readUInt32LE(4) };
-            break;
-        } catch { /* not a readable asar — try the next candidate */ }
-    }
-    return asarCache;
-}
-
-function asarEntry(asar, innerPath) {
-    let node = asar.header;
-    for (const part of innerPath.split('/').filter(Boolean)) {
-        node = node?.files?.[part];
-        if (!node) return null;
-    }
-    return node.files ? null : node;
-}
-
-function asarList(asar, dir) {
-    let node = asar.header;
-    for (const part of dir.split('/').filter(Boolean)) node = node?.files?.[part];
-    const out = [];
-    const walk = (n, prefix) => {
-        for (const [name, child] of Object.entries(n?.files || {})) {
-            if (child.files) walk(child, `${prefix}${name}/`);
-            else out.push(prefix + name);
-        }
-    };
-    walk(node, '');
-    return out;
-}
-
-const STICKER_DIR = 'static/snowbird/resource/stickers';
-const ILLUSTRATION_DIR = 'static/snowbird/resource/illustrations';
-
-function libraryAsset(kind, name, where) {
-    const asar = xmindAsar();
-    if (!asar) {
-        throw new Error(`${where}: ${kind}s come from XMind's own library, but no XMind installation was found ` +
-            '(set XMIND_APP_ASAR to its app.asar). Use an image file instead: "image": "/abs/picture.png".');
-    }
-    const dir = kind === 'sticker' ? STICKER_DIR : ILLUSTRATION_DIR;
-    const names = asarList(asar, dir);
-    const wanted = String(name).toLowerCase().replace(/\.(svg|png)$/, '');
-    const hit = names.find(n => n.toLowerCase().replace(/\.(svg|png)$/, '') === wanted);
-    if (!hit) {
-        const base = wanted.split('/').pop();
-        const near = names.filter(x => {
-            const nm = x.toLowerCase().replace(/\.(svg|png)$/, '').split('/').pop();
-            return nm.includes(base) || base.includes(nm) || nm.startsWith(base.slice(0, 4));
-        }).slice(0, 8);
-        throw new Error(`${where}: no ${kind} "${name}" in XMind's library.` +
-            (near.length ? ` Close matches: ${near.map(n => n.replace(/\.(svg|png)$/, '')).join(', ')}.` : '') +
-            ` List them with read_xmind.mjs {"action": "list_${kind}s"}.`);
-    }
-    const entry = asarEntry(asar, `${dir}/${hit}`);
-    const start = asar.base + Number(entry.offset);
-    return { data: Buffer.from(asar.buf.subarray(start, start + entry.size)), ext: extname(hit).toLowerCase() };
-}
-
-// ── LaTeX → SVG ──
-// A small dependency-free typesetter for the usual LaTeX subset (fractions, scripts, roots, Greek,
-// operators, \text). XMind stores an equation as an image plus its LaTeX source (mathJax
-// extension); when the equation is edited in XMind, its own MathJax renders it again.
-const TEX_SYMBOLS = {
-    alpha: 'α', beta: 'β', gamma: 'γ', delta: 'δ', epsilon: 'ε', varepsilon: 'ε', zeta: 'ζ', eta: 'η',
-    theta: 'θ', vartheta: 'ϑ', iota: 'ι', kappa: 'κ', lambda: 'λ', mu: 'μ', nu: 'ν', xi: 'ξ', pi: 'π',
-    varpi: 'ϖ', rho: 'ρ', sigma: 'σ', tau: 'τ', upsilon: 'υ', phi: 'φ', varphi: 'φ', chi: 'χ', psi: 'ψ',
-    omega: 'ω', Gamma: 'Γ', Delta: 'Δ', Theta: 'Θ', Lambda: 'Λ', Xi: 'Ξ', Pi: 'Π', Sigma: 'Σ',
-    Upsilon: 'Υ', Phi: 'Φ', Psi: 'Ψ', Omega: 'Ω',
-    times: '×', cdot: '·', div: '÷', pm: '±', mp: '∓', leq: '≤', le: '≤', geq: '≥', ge: '≥', neq: '≠',
-    ne: '≠', approx: '≈', equiv: '≡', sim: '∼', propto: '∝', infty: '∞', partial: '∂', nabla: '∇',
-    sum: '∑', prod: '∏', int: '∫', oint: '∮', in: '∈', notin: '∉', subset: '⊂', subseteq: '⊆',
-    supset: '⊃', cup: '∪', cap: '∩', emptyset: '∅', forall: '∀', exists: '∃', neg: '¬', land: '∧',
-    lor: '∨', to: '→', rightarrow: '→', leftarrow: '←', Rightarrow: '⇒', Leftarrow: '⇐',
-    leftrightarrow: '↔', Leftrightarrow: '⇔', mapsto: '↦', ldots: '…', cdots: '⋯', dots: '…',
-    circ: '∘', degree: '°', prime: '′', angle: '∠', perp: '⊥', parallel: '∥', hbar: 'ℏ', ell: 'ℓ',
-    Re: 'ℜ', Im: 'ℑ', aleph: 'ℵ', langle: '⟨', rangle: '⟩', lfloor: '⌊', rfloor: '⌋', lceil: '⌈',
-    rceil: '⌉', quad: '  ', qquad: '    ', ',': ' ', ';': ' ', ':': ' ', '!': '', ' ': ' ',
-    '{': '{', '}': '}', '%': '%', '$': '$', '#': '#', '&': '&', _: '_', lbrace: '{', rbrace: '}',
-    vert: '|', mid: '|', backslash: '\\', star: '⋆', ast: '∗', bullet: '•', oplus: '⊕', otimes: '⊗',
-};
-const TEX_FUNCS = new Set(['sin', 'cos', 'tan', 'cot', 'sec', 'csc', 'log', 'ln', 'exp', 'lim', 'max', 'min',
-    'det', 'arg', 'sup', 'inf', 'arcsin', 'arccos', 'arctan', 'sinh', 'cosh', 'tanh', 'gcd', 'mod']);
-
-function parseTex(src) {
-    let i = 0;
-    const group = stop => {
-        const items = [];
-        while (i < src.length) {
-            const c = src[i];
-            if (c === stop) { i++; break; }
-            if (c === '}' && stop !== '}') { i++; continue; }
-            items.push(atom());
-        }
-        return { type: 'row', items };
-    };
-    const arg = () => {
-        while (src[i] === ' ') i++;
-        if (src[i] === '{') { i++; return group('}'); }
-        return atom();
-    };
-    const atom = () => {
-        const c = src[i];
-        if (c === '{') { i++; return group('}'); }
-        if (c === '^' || c === '_') {
-            i++;
-            return { type: c === '^' ? 'sup' : 'sub', body: arg() };
-        }
-        if (c === '\\') {
-            i++;
-            let name = '';
-            if (/[a-zA-Z]/.test(src[i] || '')) while (/[a-zA-Z]/.test(src[i] || '')) name += src[i++];
-            else name = src[i++] || '';
-            if (name === 'frac' || name === 'dfrac' || name === 'tfrac') return { type: 'frac', num: arg(), den: arg() };
-            if (name === 'sqrt') {
-                let index = null;
-                if (src[i] === '[') { const j = src.indexOf(']', i); index = { type: 'text', text: src.slice(i + 1, j) }; i = j + 1; }
-                return { type: 'sqrt', body: arg(), index };
-            }
-            if (['text', 'mathrm', 'textrm', 'operatorname', 'mathbf', 'textbf', 'mathit', 'mathsf', 'mathtt'].includes(name)) {
-                const body = arg();
-                const flat = n => n.type === 'text' ? n.text : n.type === 'row' ? n.items.map(flat).join('') : '';
-                return { type: 'text', text: flat(body), upright: !/it$/.test(name), bold: /bf$/.test(name) };
-            }
-            if (name === 'left' || name === 'right' || name === 'big' || name === 'Big' || name === 'bigg') {
-                return atom();
-            }
-            if (name === 'overline' || name === 'bar' || name === 'hat' || name === 'vec' || name === 'tilde' || name === 'dot') {
-                return { type: 'accent', accent: { overline: '‾', bar: '¯', hat: 'ˆ', vec: '→', tilde: '˜', dot: '˙' }[name], body: arg() };
-            }
-            if (TEX_FUNCS.has(name)) return { type: 'text', text: name, upright: true };
-            if (TEX_SYMBOLS[name] !== undefined) return { type: 'text', text: TEX_SYMBOLS[name], upright: true };
-            return { type: 'text', text: name, upright: true };
-        }
-        i++;
-        if (c === ' ') return { type: 'text', text: '', upright: true };
-        const ch = { '-': '−', '*': '∗', "'": '′' }[c] || c;
-        return { type: 'text', text: ch, upright: !/[a-zA-Z]/.test(c) };
-    };
-    return group(null);
-}
-
-function escapeSvg(t) {
-    return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-// Lay out a parsed node at font size `fs`; returns {w, asc, desc, draw(x, y) → svg}.
-function layoutTex(node, fs) {
-    const cw = (t, upright) => [...t].reduce((w, ch) => w + fs * (/[ilj.,;:!'|]/.test(ch) ? 0.3
-        : /[mwMW∑∏]/.test(ch) ? 0.85 : /[A-Z0-9]/.test(ch) ? 0.62 : upright ? 0.55 : 0.5), 0);
-    switch (node.type) {
-    case 'text': {
-        const w = cw(node.text, node.upright) + (node.text && /[=+\-−×·÷±<>≤≥≠≈→⇒∈]/.test(node.text) ? fs * 0.3 : 0);
-        return {
-            w, asc: fs * 0.75, desc: fs * 0.25,
-            draw: (x, y) => node.text ? `<text x="${(x + (w - cw(node.text, node.upright)) / 2).toFixed(1)}" y="${y.toFixed(1)}" font-size="${fs.toFixed(1)}"` +
-                `${node.upright ? '' : ' font-style="italic"'}${node.bold ? ' font-weight="bold"' : ''}>${escapeSvg(node.text)}</text>` : '',
-        };
-    }
-    case 'row': {
-        const parts = [];
-        let w = 0, asc = fs * 0.75, desc = fs * 0.25;
-        for (let k = 0; k < node.items.length; k++) {
-            const it = node.items[k];
-            if (it.type === 'sup' || it.type === 'sub') {
-                const b = layoutTex(it.body, fs * 0.7);
-                const shift = it.type === 'sup' ? -fs * 0.42 : fs * 0.25;
-                parts.push({ x: w, dy: shift, box: b });
-                asc = Math.max(asc, b.asc - shift); desc = Math.max(desc, b.desc + shift);
-                // a ^ directly followed by _ (or the reverse) stacks on the same x
-                const nx = node.items[k + 1];
-                if (nx && (nx.type === 'sup' || nx.type === 'sub') && nx.type !== it.type) {
-                    const b2 = layoutTex(nx.body, fs * 0.7);
-                    const s2 = nx.type === 'sup' ? -fs * 0.42 : fs * 0.25;
-                    parts.push({ x: w, dy: s2, box: b2 });
-                    asc = Math.max(asc, b2.asc - s2); desc = Math.max(desc, b2.desc + s2);
-                    w += Math.max(b.w, b2.w); k++;
-                } else w += b.w;
-                continue;
-            }
-            const b = layoutTex(it, fs);
-            parts.push({ x: w, dy: 0, box: b });
-            w += b.w; asc = Math.max(asc, b.asc); desc = Math.max(desc, b.desc);
-        }
-        return { w, asc, desc, draw: (x, y) => parts.map(p => p.box.draw(x + p.x, y + p.dy)).join('') };
-    }
-    case 'frac': {
-        const n = layoutTex(node.num, fs * 0.85), d = layoutTex(node.den, fs * 0.85);
-        const w = Math.max(n.w, d.w) + fs * 0.3, axis = fs * 0.3;
-        return {
-            w, asc: axis + n.asc + n.desc + fs * 0.12, desc: d.asc + d.desc + fs * 0.12 - axis,
-            draw: (x, y) => n.draw(x + (w - n.w) / 2, y - axis - n.desc - fs * 0.12) +
-                `<line x1="${(x + fs * 0.05).toFixed(1)}" x2="${(x + w - fs * 0.05).toFixed(1)}" y1="${(y - axis).toFixed(1)}" y2="${(y - axis).toFixed(1)}" stroke="currentColor" stroke-width="${(fs * 0.06).toFixed(2)}"/>` +
-                d.draw(x + (w - d.w) / 2, y - axis + d.asc + fs * 0.12),
-        };
-    }
-    case 'sqrt': {
-        const b = layoutTex(node.body, fs), pad = fs * 0.55;
-        const idx = node.index ? layoutTex(node.index, fs * 0.55) : null;
-        const lead = idx ? Math.max(0, idx.w - pad * 0.4) : 0;
-        return {
-            w: lead + pad + b.w + fs * 0.1, asc: b.asc + fs * 0.15, desc: b.desc,
-            draw: (x, y) => {
-                const x0 = x + lead, top = y - b.asc - fs * 0.1, bottom = y + b.desc;
-                return (idx ? idx.draw(x, y - b.asc * 0.55) : '') +
-                    `<polyline fill="none" stroke="currentColor" stroke-width="${(fs * 0.06).toFixed(2)}" points="${(x0 + fs * 0.05).toFixed(1)},${(y - fs * 0.25).toFixed(1)} ${(x0 + pad * 0.35).toFixed(1)},${bottom.toFixed(1)} ${(x0 + pad * 0.8).toFixed(1)},${top.toFixed(1)} ${(x0 + pad + b.w + fs * 0.1).toFixed(1)},${top.toFixed(1)}"/>` +
-                    b.draw(x0 + pad, y);
-            },
-        };
-    }
-    case 'accent': {
-        const b = layoutTex(node.body, fs);
-        return { w: b.w, asc: b.asc + fs * 0.3, desc: b.desc,
-            draw: (x, y) => b.draw(x, y) + `<text x="${(x + b.w / 2).toFixed(1)}" y="${(y - b.asc + fs * 0.05).toFixed(1)}" font-size="${(fs * 0.8).toFixed(1)}" text-anchor="middle">${node.accent}</text>` };
-    }
-    default:
-        return { w: 0, asc: 0, desc: 0, draw: () => '' };
-    }
-}
-
-function latexToSvg(latex, { fontSize = 28, color = '#1E1E1E' } = {}) {
-    const box = layoutTex(parseTex(String(latex).trim().replace(/^\$+|\$+$/g, '')), fontSize);
-    const padX = fontSize * 0.3, padY = fontSize * 0.25;
-    const w = Math.ceil(box.w + 2 * padX), h = Math.ceil(box.asc + box.desc + 2 * padY);
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" color="${color}">` +
-        `<g fill="${color}" font-family="'Latin Modern Math','Cambria Math','STIX Two Math','Times New Roman',serif">` +
-        box.draw(padX, padY + box.asc) + '</g></svg>';
-    return { svg, width: w, height: h };
-}
+// ─── Rich content: equations, video, audio ───
 
 // ── Web video / link preview ──
 function videoEmbedUrl(url) {
@@ -1087,32 +724,7 @@ function videoPlaceholderSvg(label) {
 
 const AUDIO_EXTS = new Set(['.mp3', '.m4a', '.aac', '.wav', '.ogg', '.oga', '.webm', '.flac']);
 
-// ─── Password protection (XMind's own scheme) ───
-// Each entry (content.json, metadata.json, every resource) is encrypted on its own with AES-128-CBC;
-// the key comes from PBKDF2-HMAC-SHA512 (1024 iterations, 8-byte salt). manifest.json stays
-// readable and records the parameters per entry, which is what XMind expects when it asks for the
-// password. (XMind labels the two algorithms the other way round in the manifest — kept as is.)
-function encryptEntry(data, password) {
-    const salt = randomBytes(8), iv = randomBytes(16);
-    const key = pbkdf2Sync(Buffer.from(password, 'utf-8'), salt, 1024, 16, 'sha512');
-    const cipher = createCipheriv('aes-128-cbc', key, iv);
-    const out = Buffer.concat([cipher.update(data), cipher.final()]);
-    return {
-        data: out,
-        meta: {
-            'encryption-data': {
-                size: 128, 'iteration-count': 1024, 'algorithm-name': 'AES/CBC/PKCS5Padding',
-                'key-derivation-name': 'PBKDF2WithHmacSHA512', salt: salt.toString('base64'), iv: iv.toString('base64'),
-            },
-        },
-    };
-}
-
 // ─── XMind builder ───
-
-function generateId() {
-    return randomUUID().replace(/-/g, '').substring(0, 26);
-}
 
 class XMindBuilder {
     constructor() {
@@ -1120,6 +732,9 @@ class XMindBuilder {
         this.titleCount = new Map();
         this.refToId = new Map();
         this.inputIdToId = new Map(); // id carried by an input topic (from the reader) -> new id
+        this.topicSheet = new Map(); // topic id -> index of the sheet it is on
+        this.customMarkerIds = new Set(); // ids usable in topic markers on the sheet being built
+        this.sheetIndex = 0;
         this.pendingDependencies = new Map();
         this.pendingLinks = new Map();
         this.attachments = []; // {sourcePath, resourcePath}
@@ -1200,7 +815,10 @@ class XMindBuilder {
         });
 
         const builtSheets = [];
-        for (const sheet of sheets) {
+        for (const [sheetIndex, sheet] of sheets.entries()) {
+            this.sheetIndex = sheetIndex;
+            this.customMarkerIds = new Set([...(sheet.customMarkers || sheet.rootTopic?.customMarkers || []).map(m => String(m.id)),
+                ...(existingSheetsByTitle?.get(sheet.title)?.[0]?.customMarkerGroups || []).flatMap(g => (g.markers || []).map(m => m.id))]);
             // Sheets with duplicate titles are matched in order (first existing sheet with this
             // title pairs with the first rebuilt sheet with this title, etc.) rather than all
             // reusing the same existing sheet.
@@ -1229,7 +847,7 @@ class XMindBuilder {
             }
         }
 
-        const contentJson = builtSheets.map(({ rootTopic, detached, sheet, existingSheet }) => {
+        const contentJson = builtSheets.map(({ rootTopic, detached, sheet, existingSheet }, sheetIndex) => {
             // An explicit `theme` wins. Otherwise preserve the previous sheet's visual theme when
             // a sheet with the same title already existed — without this, every regeneration
             // resets styling to XMind's bare default.
@@ -1288,6 +906,14 @@ class XMindBuilder {
                 sheetObj.relationships = sheet.relationships.map((rel, i) => {
                     const end1Id = this.lookup(rel.sourceRef, rel.sourceTitle, 'Relationship source', rel.end1Id);
                     const end2Id = this.lookup(rel.targetRef, rel.targetTitle, 'Relationship target', rel.end2Id);
+                    // XMind draws relationships only between topics on the same sheet.
+                    for (const [end, label] of [[end1Id, 'source'], [end2Id, 'target']]) {
+                        if (this.topicSheet.get(end) !== sheetIndex) {
+                            throw new Error(`Sheet "${sheet.title}" relationship ${i + 1}${rel.title ? ` ("${rel.title}")` : ''}: ` +
+                                `its ${label} is on another sheet — relationships must connect topics on the same sheet ` +
+                                '(use "linkToTopic" / "linkToRef" to link across sheets).');
+                        }
+                    }
                     const r = { id: generateId(), end1Id, end2Id };
                     if (rel.title) r.title = rel.title;
                     const relProps = relationshipStyleProps(rel,
@@ -1318,7 +944,7 @@ class XMindBuilder {
 
         // Explicit thumbnail (shown by Finder / XMind's recent-files list). Must be PNG.
         if (thumbnailPath) {
-            const data = await readFile(resolve(thumbnailPath));
+            const data = await readFile(noteLocalFile(thumbnailPath));
             if (data.length < 8 || data.readUInt32BE(0) !== 0x89504E47) {
                 throw new Error(`thumbnail must be a PNG file: ${thumbnailPath}`);
             }
@@ -1327,7 +953,7 @@ class XMindBuilder {
         }
 
         for (const att of attachments) {
-            const data = await readFile(resolve(att.sourcePath));
+            const data = await readFile(noteLocalFile(att.sourcePath));
             const hash = createHash('sha256').update(data).digest('hex');
             const ext = extname(att.sourcePath);
             const resourcePath = `resources/${hash}${ext}`;
@@ -1370,7 +996,7 @@ class XMindBuilder {
             content: JSON.stringify(contentJson),
             metadata: existingMetadataRaw || JSON.stringify({
                 dataStructureVersion: "3",
-                creator: { name: "xmind-skill", version: "1.0.0" },
+                creator: { name: "xmind-skill", version: VERSION },
                 layoutEngineVersion: "5",
             }),
             manifest: JSON.stringify({ "file-entries": fileEntries }),
@@ -1388,6 +1014,7 @@ class XMindBuilder {
         if (topic.id === topicId) { topic.href = href; return true; }
         for (const child of topic.children?.attached || []) if (this._setHref(child, topicId, href)) return true;
         for (const child of topic.children?.callout || []) if (this._setHref(child, topicId, href)) return true;
+        for (const child of topic.children?.detached || []) if (this._setHref(child, topicId, href)) return true;
         return false;
     }
 
@@ -1444,7 +1071,8 @@ class XMindBuilder {
             const name = String(opts.src).replace(/^xap:/, '');
             if (!this.existingResourceNames.has(name) && !this.images.has(name)) {
                 throw new Error(`${where}: image "${opts.src}" is not in the file being overwritten. ` +
-                    'Use {"path": "/abs/image.png"} to embed a new image.');
+                    'Saving a map you read to a new path? Add "sourcePath": "<the file you read>". ' +
+                    'Otherwise drop this image — only embed a picture file the user asked for.');
             }
             // Same image as before: keep its size unless the input changes it.
             const base = previous?.image?.src === `xap:${name}` ? previous.image : {};
@@ -1472,7 +1100,7 @@ class XMindBuilder {
             ext = extname(opts.path).toLowerCase();
             if (!IMAGE_EXTS.has(ext)) throw new Error(`${where}: unsupported image type "${ext}" (use png, jpg, gif or svg).`);
             if (!existsSync(resolve(opts.path))) throw new Error(`${where}: image file not found: ${opts.path}`);
-            data = readFileSync(resolve(opts.path));
+            data = readFileSync(noteLocalFile(opts.path));
         }
         let natural = imageSize(data, ext);
         if (!(natural?.width > 0 && natural?.height > 0)) {
@@ -1592,13 +1220,14 @@ class XMindBuilder {
             let src = typeof input.audio === 'string' ? input.audio : input.audio.path || input.audio.src;
             if (String(src).startsWith('xap:')) {
                 if (!this.existingResourceNames.has(src.slice(4)) && !this.images.has(src.slice(4))) {
-                    throw new Error(`${where}: audio "${src}" is not in the file being overwritten.`);
+                    throw new Error(`${where}: audio "${src}" is not in the file being overwritten. ` +
+                        'Saving a map you read to a new path? Add "sourcePath": "<the file you read>".');
                 }
             } else {
                 const e = extname(src).toLowerCase();
                 if (!AUDIO_EXTS.has(e)) throw new Error(`${where}: unsupported audio type "${e}" (${[...AUDIO_EXTS].join(', ')}).`);
                 if (!existsSync(resolve(src))) throw new Error(`${where}: audio file not found: ${src}`);
-                src = `xap:${this.storeResource(readFileSync(resolve(src)), e)}`;
+                src = `xap:${this.storeResource(readFileSync(noteLocalFile(src)), e)}`;
             }
             ext.push({ provider: 'org.xmind.ui.audionotes', content: null, resources: [src] });
         }
@@ -1624,6 +1253,7 @@ class XMindBuilder {
 
     buildTopic(input, { detached = false, key = null } = {}) {
         const id = generateId();
+        this.topicSheet.set(id, this.sheetIndex);
         if (!this.titleToId.has(input.title)) this.titleToId.set(input.title, id);
         this.titleCount.set(input.title, (this.titleCount.get(input.title) || 0) + 1);
         if (input.ref !== undefined) {
@@ -1643,7 +1273,9 @@ class XMindBuilder {
             topic.attributedTitle = previous.attributedTitle;
         }
 
-        if (input.structureClass) topic.structureClass = input.structureClass;
+        if (input.structureClass) {
+            topic.structureClass = xmindClass(input.structureClass, 'org.xmind.ui.', K.KNOWN.structure, 'layout (structureClass)', `Topic "${input.title}"`);
+        }
         else if (input.structureClass === undefined && previous?.structureClass) {
             topic.structureClass = previous.structureClass;
         }
@@ -1706,24 +1338,62 @@ class XMindBuilder {
             this.pendingLinks.set(id, { ref: input.linkToRef, title: input.linkToTopic });
         }
         if (input.labels) topic.labels = input.labels;
-        if (input.markers?.length > 0) topic.markers = input.markers.map(m => ({ markerId: m }));
+        if (input.markers?.length > 0) {
+            for (const m of input.markers) {
+                if (!K.MARKER_PREFIX.test(m) && !this.customMarkerIds.has(m)) {
+                    console.error(`Warning: Topic "${input.title}": marker "${m}" is neither a built-in marker nor one of the sheet's customMarkers — XMind shows nothing for it.`);
+                }
+            }
+            topic.markers = input.markers.map(m => ({ markerId: m }));
+        }
 
         const hasTaskProps = input.taskStatus || input.progress !== undefined ||
             input.priority !== undefined || input.startDate || input.dueDate ||
             input.durationDays !== undefined || input.duration !== undefined || input.dependencies;
         if (hasTaskProps) {
             const tc = {};
-            if (input.taskStatus) tc.status = input.taskStatus;
-            if (input.progress !== undefined) tc.progress = input.progress;
-            if (input.priority !== undefined) tc.priority = input.priority;
-            if (input.startDate) tc.start = new Date(input.startDate).getTime();
-            if (input.dueDate) {
-                tc.due = new Date(input.dueDate).getTime();
-                if (input.startDate) tc.duration = new Date(input.dueDate).getTime() - new Date(input.startDate).getTime();
+            if (input.taskStatus) tc.status = oneOf(input.taskStatus, TASK_STATUSES, 'taskStatus', where);
+            if (input.progress !== undefined) {
+                if (!(typeof input.progress === 'number' && Number.isFinite(input.progress))) {
+                    throw new Error(`${where}: progress must be a number from 0 to 1 (got ${JSON.stringify(input.progress)}).`);
+                }
+                tc.progress = Math.min(1, Math.max(0, input.progress));
+                if (tc.progress !== input.progress) console.error(`Warning: ${where}: progress ${input.progress} clamped to ${tc.progress} (0 = not started, 1 = done).`);
             }
-            if (input.durationDays !== undefined && !input.startDate) tc.duration = input.durationDays * 86400000;
-            // `duration` (milliseconds) is what read_xmind.mjs returns.
-            else if (input.duration !== undefined && tc.duration === undefined) tc.duration = input.duration;
+            if (input.priority !== undefined) {
+                if (!(Number.isInteger(input.priority) && input.priority >= 1 && input.priority <= 9)) {
+                    throw new Error(`${where}: priority must be a whole number from 1 (highest) to 9 (got ${JSON.stringify(input.priority)}).`);
+                }
+                tc.priority = input.priority;
+            }
+            const start = input.startDate != null ? taskDate(input.startDate, 'startDate', where) : undefined;
+            const due = input.dueDate != null ? taskDate(input.dueDate, 'dueDate', where) : undefined;
+            let days;
+            if (input.durationDays !== undefined) {
+                if (!(typeof input.durationDays === 'number' && input.durationDays >= 0)) {
+                    throw new Error(`${where}: durationDays must be a number of days ≥ 0.`);
+                }
+                days = input.durationDays * 86400000;
+            }
+            if (start !== undefined) tc.start = start;
+            if (start !== undefined && due !== undefined) {
+                if (due < start) throw new Error(`${where}: dueDate is before startDate.`);
+                tc.due = due;
+                tc.duration = due - start;
+                if (days !== undefined && days !== tc.duration) {
+                    console.error(`Warning: ${where}: durationDays doesn't match startDate → dueDate; the dates win.`);
+                }
+            } else if (start !== undefined && days !== undefined) {
+                tc.due = start + days; // start + length → due date
+                tc.duration = days;
+            } else if (due !== undefined) {
+                tc.due = due;
+                if (days !== undefined) { tc.duration = days; tc.start = due - days; }
+            } else if (days !== undefined) {
+                tc.duration = days; // relative planning: XMind places it after its dependencies
+            } else if (input.duration !== undefined && tc.duration === undefined) {
+                tc.duration = input.duration; // milliseconds — what read_xmind.mjs returns
+            }
             if (input.dependencies?.length > 0) this.pendingDependencies.set(id, input.dependencies);
             topic.extensions = [{ provider: 'org.xmind.ui.task', content: tc }];
         }
@@ -1812,282 +1482,63 @@ class XMindBuilder {
     }
 }
 
-// ─── XMind 8 Legacy XML builder ───
-
-function escapeXml(str) {
-    return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&apos;');
+// Write to a temporary file next to the target, then rename over it: an interrupted write never
+// leaves a half-written file in place of the original.
+// Every file from the user's disk that goes into the output is listed after writing, so a map
+// that asks for an unexpected file (e.g. one copied from a file someone else sent) is noticed.
+const LOCAL_FILES = new Set();
+function noteLocalFile(p) {
+    const abs = resolve(p);
+    LOCAL_FILES.add(abs);
+    return abs;
 }
 
-// XMind 8 keeps styles in styles.xml and points to them with style-id; a <style> element inside
-// <topic> is ignored. Styles are collected here while content.xml is written.
-let legacyStyles = null; // [{id, type, props}]
-
-function legacyStyleId(type, props) {
-    if (!legacyStyles || !props || Object.keys(props).length === 0) return null;
-    const id = generateId();
-    legacyStyles.push({ id, type, props });
-    return id;
+// A symlinked target is followed (the real file is updated, the link stays a link) and the existing
+// file's permissions are kept.
+// The temp file is created exclusively and owner-only, so nobody can read the map while it is written.
+async function writeAtomic(path, data) {
+    writeFileAtomicSync(path, data);
 }
 
-function buildLegacyStyles(styles) {
-    let xml = '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n';
-    xml += '<xmap-styles xmlns="urn:xmind:xmap:xmlns:style:2.0" xmlns:fo="http://www.w3.org/1999/XSL/Format"';
-    xml += ' xmlns:svg="http://www.w3.org/2000/svg" version="2.0">\n  <styles>\n';
-    for (const st of styles) {
-        const attrs = Object.entries(st.props)
-            .filter(([k]) => /^[a-z][\w:-]*$/i.test(k))
-            .map(([k, v]) => `${k}="${escapeXml(v)}"`).join(' ');
-        xml += `    <style id="${escapeXml(st.id)}" type="${st.type}">\n`;
-        xml += `      <${st.type}-properties ${attrs}/>\n`;
-        xml += '    </style>\n';
+// Validate first, then write. A file with validation errors never replaces an existing file (that
+// would lose a good original): nothing is written and the exit code is 2. A new file is written and
+// also exits with 2, so the problems get fixed.
+async function writeChecked(path, buf, password, createdMessage) {
+    const v = validateBuffer(buf, { password });
+    const warn = v.warnings || [];
+    if (v.errors?.length) {
+        const keep = existsSync(path);
+        console.error(`Validation: ${v.errors.length} error(s) — XMind will not show this as intended:`);
+        for (const e of v.errors) console.error(`  - ${e}`);
+        for (const w of warn) console.error(`  warning: ${w}`);
+        process.exitCode = 2;
+        if (keep) {
+            console.error(`Nothing was written: ${path} keeps its previous content. Fix the errors and run again.`);
+            return;
+        }
+        await writeAtomic(path, buf);
+        console.log(createdMessage);
+        return;
     }
-    xml += '  </styles>\n</xmap-styles>\n';
-    return xml;
+    await writeAtomic(path, buf);
+    console.log(createdMessage);
+    if (LOCAL_FILES.size) console.log(`Embedded files from disk: ${[...LOCAL_FILES].join(', ')}`);
+    console.log(`Validation: ok${warn.length ? ` (${warn.length} warning(s))` : ''}`);
+    for (const w of warn) console.error(`  warning: ${w}`);
 }
 
-// The sheet theme has no XMind 8 equivalent that survives import, so for legacy output it is folded
-// into each topic's own style (central / main / sub / floating slot by depth), under the topic's
-// explicit properties. Set per sheet by buildLegacyXml.
-let legacyTheme = null;
-
-function themedProps(slot, own) {
-    const base = legacyTheme?.[slot]?.properties || {};
-    const merged = { ...base, ...(own || {}) };
-    return Object.keys(merged).length > 0 ? merged : null;
-}
-
-function topicToXml(topic, indent = '      ', slot = 'centralTopic') {
-    const attrs = [`id="${escapeXml(topic.id)}"`];
-    if (topic.branch === 'folded') attrs.push('branch="folded"');
-    const styleId = legacyStyleId('topic', themedProps(slot, topic.style?.properties));
-    if (styleId) attrs.push(`style-id="${styleId}"`);
-    if (topic.structureClass) attrs.push(`structure-class="${escapeXml(topic.structureClass)}"`);
-    if (topic.href) attrs.push(`xlink:href="${escapeXml(topic.href)}"`);
-
-    let xml = `${indent}<topic ${attrs.join(' ')}>\n`;
-    xml += `${indent}  <title>${escapeXml(topic.title)}</title>\n`;
-
-    // Position
-    if (topic.position) {
-        xml += `${indent}  <position svg:x="${topic.position.x}" svg:y="${topic.position.y}"/>\n`;
-    }
-
-    // Image (an equation's rendered image is kept too — XMind 8 has no equation object)
-    if (topic.image?.src) {
-        const imgAttrs = [`xhtml:src="${escapeXml(topic.image.src)}"`];
-        if (topic.image.width) imgAttrs.push(`svg:width="${topic.image.width}"`);
-        if (topic.image.height) imgAttrs.push(`svg:height="${topic.image.height}"`);
-        if (topic.image.align) imgAttrs.push(`align="${escapeXml(topic.image.align)}"`);
-        xml += `${indent}  <xhtml:img ${imgAttrs.join(' ')}/>\n`;
-    }
-
-    // Notes
-    if (topic.notes) {
-        xml += `${indent}  <notes>\n`;
-        if (topic.notes.plain) {
-            xml += `${indent}    <plain>${escapeXml(topic.notes.plain.content)}</plain>\n`;
-        }
-        if (topic.notes.realHTML) {
-            xml += `${indent}    <html><![CDATA[${topic.notes.realHTML.content}]]></html>\n`;
-        }
-        xml += `${indent}  </notes>\n`;
-    }
-
-    // Labels
-    if (topic.labels?.length > 0) {
-        xml += `${indent}  <labels>\n`;
-        for (const label of topic.labels) {
-            xml += `${indent}    <label>${escapeXml(label)}</label>\n`;
-        }
-        xml += `${indent}  </labels>\n`;
-    }
-
-    // Markers
-    if (topic.markers?.length > 0) {
-        xml += `${indent}  <marker-refs>\n`;
-        for (const m of topic.markers) {
-            xml += `${indent}    <marker-ref marker-id="${escapeXml(m.markerId)}"/>\n`;
-        }
-        xml += `${indent}  </marker-refs>\n`;
-    }
-
-    // Boundaries
-    if (topic.boundaries?.length > 0) {
-        xml += `${indent}  <boundaries>\n`;
-        for (const b of topic.boundaries) {
-            const bStyle = legacyStyleId('boundary', b.style?.properties);
-            const bAttrs = `id="${escapeXml(b.id)}" range="${escapeXml(b.range)}"${bStyle ? ` style-id="${bStyle}"` : ''}`;
-            if (b.title) {
-                xml += `${indent}    <boundary ${bAttrs}>\n`;
-                xml += `${indent}      <title>${escapeXml(b.title)}</title>\n`;
-                xml += `${indent}    </boundary>\n`;
-            } else {
-                xml += `${indent}    <boundary ${bAttrs}/>\n`;
-            }
-        }
-        xml += `${indent}  </boundaries>\n`;
-    }
-
-    // Summaries
-    if (topic.summaries?.length > 0) {
-        xml += `${indent}  <summaries>\n`;
-        for (const s of topic.summaries) {
-            xml += `${indent}    <summary id="${escapeXml(s.id)}" range="${escapeXml(s.range)}" topic-id="${escapeXml(s.topicId)}"/>\n`;
-        }
-        xml += `${indent}  </summaries>\n`;
-    }
-
-    // Extensions (task info)
-    if (topic.extensions?.length > 0) {
-        xml += `${indent}  <extensions>\n`;
-        for (const ext of topic.extensions) {
-            xml += `${indent}    <extension provider="${escapeXml(ext.provider)}">\n`;
-            xml += `${indent}      <content>\n`;
-            const c = ext.content;
-            if (c.status) xml += `${indent}        <status>${escapeXml(c.status)}</status>\n`;
-            if (c.progress !== undefined) xml += `${indent}        <progress>${c.progress}</progress>\n`;
-            if (c.priority !== undefined) xml += `${indent}        <priority>${c.priority}</priority>\n`;
-            if (c.start !== undefined) xml += `${indent}        <start>${c.start}</start>\n`;
-            if (c.due !== undefined) xml += `${indent}        <due>${c.due}</due>\n`;
-            if (c.duration !== undefined) xml += `${indent}        <duration>${c.duration}</duration>\n`;
-            if (c.dependencies?.length > 0) {
-                xml += `${indent}        <dependencies>\n`;
-                for (const dep of c.dependencies) {
-                    xml += `${indent}          <dependency id="${escapeXml(dep.id)}" type="${escapeXml(dep.type)}" lag="${dep.lag}"/>\n`;
-                }
-                xml += `${indent}        </dependencies>\n`;
-            }
-            xml += `${indent}      </content>\n`;
-            xml += `${indent}    </extension>\n`;
-        }
-        xml += `${indent}  </extensions>\n`;
-    }
-
-    // Children — XMind 8 uses <topics type="attached|detached|callout|summary">
-    const hasAttached = topic.children?.attached?.length > 0;
-    const hasCallout = topic.children?.callout?.length > 0;
-    const hasDetached = topic.children?.detached?.length > 0;
-    // Summary topics go under <children><topics type="summary"> in XMind 8
-    const summaryTopics = topic.children?.summary || topic.summary || [];
-    const hasSummaryTopics = summaryTopics.length > 0;
-
-    if (hasAttached || hasCallout || hasDetached || hasSummaryTopics) {
-        xml += `${indent}  <children>\n`;
-        if (hasAttached) {
-            xml += `${indent}    <topics type="attached">\n`;
-            for (const child of topic.children.attached) {
-                xml += topicToXml(child, indent + '      ', slot === 'centralTopic' ? 'mainTopic' : 'subTopic');
-            }
-            xml += `${indent}    </topics>\n`;
-        }
-        if (hasCallout) {
-            xml += `${indent}    <topics type="callout">\n`;
-            for (const child of topic.children.callout) {
-                xml += `${indent}      <topic id="${escapeXml(child.id)}">\n`;
-                xml += `${indent}        <title>${escapeXml(child.title)}</title>\n`;
-                xml += `${indent}      </topic>\n`;
-            }
-            xml += `${indent}    </topics>\n`;
-        }
-        if (hasDetached) {
-            xml += `${indent}    <topics type="detached">\n`;
-            for (const child of topic.children.detached) {
-                xml += topicToXml(child, indent + '      ', 'floatingTopic');
-            }
-            xml += `${indent}    </topics>\n`;
-        }
-        if (hasSummaryTopics) {
-            xml += `${indent}    <topics type="summary">\n`;
-            for (const st of summaryTopics) {
-                xml += `${indent}      <topic id="${escapeXml(st.id)}">\n`;
-                xml += `${indent}        <title>${escapeXml(st.title)}</title>\n`;
-                xml += `${indent}      </topic>\n`;
-            }
-            xml += `${indent}    </topics>\n`;
-        }
-        xml += `${indent}  </children>\n`;
-    }
-
-    xml += `${indent}</topic>\n`;
-    return xml;
-}
-
-function buildLegacyXml(contentJson) {
-    let xml = '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n';
-    xml += '<xmap-content xmlns="urn:xmind:xmap:xmlns:content:2.0"';
-    xml += ' xmlns:fo="http://www.w3.org/1999/XSL/Format"';
-    xml += ' xmlns:svg="http://www.w3.org/2000/svg"';
-    xml += ' xmlns:xhtml="http://www.w3.org/1999/xhtml"';
-    xml += ' xmlns:xlink="http://www.w3.org/1999/xlink"';
-    xml += ' version="2.0">\n';
-
-    for (const sheet of contentJson) {
-        legacyTheme = sheet.theme && Object.keys(sheet.theme).length > 0 ? sheet.theme : null;
-        const mapProps = { ...(legacyTheme?.map?.properties || {}), ...(sheet.style?.properties || {}) };
-        const sheetStyle = legacyStyleId('map', mapProps['svg:fill'] ? { 'svg:fill': mapProps['svg:fill'] } : null);
-        xml += `  <sheet id="${escapeXml(sheet.id)}"${sheetStyle ? ` style-id="${sheetStyle}"` : ''}>\n`;
-        xml += `    <title>${escapeXml(sheet.title)}</title>\n`;
-        xml += topicToXml(sheet.rootTopic, '    ');
-
-        // Relationships
-        if (sheet.relationships?.length > 0) {
-            xml += '    <relationships>\n';
-            for (const rel of sheet.relationships) {
-                const relAttrs = [`id="${escapeXml(rel.id)}"`, `end1="${escapeXml(rel.end1Id)}"`, `end2="${escapeXml(rel.end2Id)}"`];
-                const relStyleId = legacyStyleId('relationship', themedProps('relationship', rel.style?.properties));
-                if (relStyleId) relAttrs.push(`style-id="${relStyleId}"`);
-                const hasChildren = rel.title || rel.controlPoints;
-                if (hasChildren) {
-                    xml += `      <relationship ${relAttrs.join(' ')}>\n`;
-                    if (rel.title) xml += `        <title>${escapeXml(rel.title)}</title>\n`;
-                    if (rel.controlPoints?.length > 0) {
-                        xml += '        <control-points>\n';
-                        rel.controlPoints.forEach((cp, i) => {
-                            const cpAttrs = [`index="${i}"`];
-                            if (cp.amount !== undefined) cpAttrs.push(`amount="${cp.amount}"`);
-                            if (cp.angle !== undefined) cpAttrs.push(`angle="${cp.angle}"`);
-                            xml += `          <control-point ${cpAttrs.join(' ')}/>\n`;
-                        });
-                        xml += '        </control-points>\n';
-                    }
-                    xml += '      </relationship>\n';
-                } else {
-                    xml += `      <relationship ${relAttrs.join(' ')}/>\n`;
-                }
-            }
-            xml += '    </relationships>\n';
-        }
-
-        xml += '  </sheet>\n';
-    }
-    legacyTheme = null;
-
-    xml += '</xmap-content>\n';
-    return xml;
-}
-
-function buildLegacyMeta() {
-    let xml = '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n';
-    xml += '<meta xmlns="urn:xmind:xmap:xmlns:meta:2.0" version="2.0">\n';
-    xml += '  <Creator><Name>xmind-skill</Name><Version>1.0.0</Version></Creator>\n';
-    xml += '</meta>\n';
-    return xml;
-}
-
-function buildLegacyManifest(fileEntries) {
-    let xml = '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n';
-    xml += '<manifest xmlns="urn:xmind:xmap:xmlns:manifest:1.0">\n';
-    for (const entry of Object.keys(fileEntries)) {
-        const mediaType = entry.endsWith('.xml') ? 'text/xml' : '';
-        xml += `  <file-entry full-path="${escapeXml(entry)}"${mediaType ? ` media-type="${mediaType}"` : ''}/>\n`;
-    }
-    xml += '</manifest>\n';
-    return xml;
+// Output format: "legacy" / "xml" / "old", XMind 3–8 or years up to 2019 → XMind 8 XML; "zen" / "json" /
+// "modern" / "latest" / "new", XMind 10+ or 2020+ → modern JSON (the default). Prefixes like "xmind" or
+// "pro" and separators are ignored ("XMind 2024", "xmind-8", "pro8").
+function resolveFormat(value) {
+    const raw = String(value ?? 'zen').toLowerCase().replace(/[\s_-]+/g, '');
+    if (['legacy', 'xml', 'old'].includes(raw)) return 'legacy';
+    if (['zen', 'json', 'new', 'latest', 'modern', 'xmindzen'].includes(raw)) return 'zen';
+    const num = parseInt(raw.replace(/^(xmind|pro)/, ''), 10);
+    if (Number.isFinite(num)) return num <= 9 || (num >= 100 && num <= 2019) ? 'legacy' : 'zen';
+    console.error(`Warning: unknown format "${value}", writing the modern format. ` +
+        'Use "legacy" (XMind 8, e.g. "xmind8", "2013") or "zen" (XMind 2020+, e.g. "latest", "2024").');
+    return 'zen';
 }
 
 // Main
@@ -2106,60 +1557,7 @@ async function main() {
         process.exit(1);
     }
 
-    // ─── Format / version resolution ───
-    // Accepts many aliases so that any editor or user can specify a familiar version string.
-    //
-    // Legacy (XML-based, XMind 8 and earlier):
-    //   "legacy", "xml", "xmind8", "xmind7", "xmind6", "xmind3",
-    //   "8", "7", "6", "3", "2008", "2009", "2010", "2011", "2012", "2013"
-    //
-    // Modern (JSON-based, XMind Zen / 2020+):
-    //   "zen", "json", "xmind2020", "xmind2021", "xmind2022", "xmind2023", "xmind2024", "xmind2025", "xmind2026",
-    //   "2020", "2021", "2022", "2023", "2024", "2025", "2026", "latest", "new"
-    //
-    // Default (no format specified): "zen"
-
-    const LEGACY_ALIASES = new Set([
-        'legacy', 'xml', 'old',
-        'xmind8', 'xmind7', 'xmind6', 'xmind5', 'xmind4', 'xmind3',
-        'xmind-8', 'xmind-7', 'xmind-6',
-        '8', '7', '6', '5', '4', '3',
-        '2008', '2009', '2010', '2011', '2012', '2013',
-        'xmind2008', 'xmind2009', 'xmind2010', 'xmind2011', 'xmind2012', 'xmind2013',
-        'pro8', 'pro7', 'pro6',
-    ]);
-
-    const ZEN_ALIASES = new Set([
-        'zen', 'json', 'new', 'latest', 'modern',
-        'xmindzen', 'xmind-zen',
-        'xmind2020', 'xmind2021', 'xmind2022', 'xmind2023', 'xmind2024', 'xmind2025', 'xmind2026',
-        'xmind-2020', 'xmind-2021', 'xmind-2022', 'xmind-2023', 'xmind-2024', 'xmind-2025', 'xmind-2026',
-        '2020', '2021', '2022', '2023', '2024', '2025', '2026',
-        '10', '11', '12', '13', '14',
-    ]);
-
-    const rawFormat = (input.format || 'zen').toString().toLowerCase().replace(/\s+/g, '');
-    let resolvedFormat;
-    if (LEGACY_ALIASES.has(rawFormat)) {
-        resolvedFormat = 'legacy';
-    } else if (ZEN_ALIASES.has(rawFormat)) {
-        resolvedFormat = 'zen';
-    } else {
-        // Heuristic: numbers <= 13 are version-based (XMind 3~8 = legacy, 10+ = zen-era)
-        // Years <= 2019 are legacy, >= 2020 are zen
-        const num = parseInt(rawFormat, 10);
-        if (!isNaN(num)) {
-            if (num <= 9) resolvedFormat = 'legacy';       // XMind 3-8
-            else if (num <= 99) resolvedFormat = 'zen';     // XMind 10+
-            else if (num <= 2019) resolvedFormat = 'legacy'; // years up to 2019
-            else resolvedFormat = 'zen';                     // 2020+
-        } else {
-            console.error(`Warning: unknown format "${input.format}", defaulting to zen (modern JSON format).`);
-            console.error('  Legacy (XML):  "xmind8", "legacy", "xml", "8", "2013"');
-            console.error('  Modern (JSON): "zen", "latest", "xmind2024", "2024"');
-            resolvedFormat = 'zen';
-        }
-    }
+    const resolvedFormat = resolveFormat(input.format);
 
     const builder = new XMindBuilder();
 
@@ -2170,7 +1568,37 @@ async function main() {
     // extensions and embedded resources (thumbnail, attachments) when regenerating — see
     // loadExistingXMind(). Legacy-format rebuilds don't carry theme state the same way, so this
     // only applies when producing zen output.
-    const existing = resolvedFormat === 'zen' ? await loadExistingXMind(resolvedPath, input.password) : null;
+    if (resolvedFormat === 'legacy' && existsSync(resolvedPath)) {
+        // A legacy rewrite would drop the protection of an existing protected file — refuse unless told to.
+        let enc = false;
+        try { enc = openZip(readFileSync(resolvedPath)).encrypted; } catch { /* not a zip */ }
+        if (enc && !input.removePassword) {
+            throw new Error(`${resolvedPath} is password-protected; XMind 8 files can't be. Nothing was written. ` +
+                'Pass "removePassword": true to replace it with an unprotected XMind 8 file.');
+        }
+    }
+    let existing = await loadExistingXMind(resolvedPath, input.password, { overwrite: input.overwrite === true });
+    // "Save as": sourcePath is the file the input was read from. Its embedded images / attachments are
+    // available to "xap:" references, and when the target is new it is the base for style preservation
+    // exactly as if it were being overwritten.
+    if (input.sourcePath) {
+        const src = resolve(input.sourcePath);
+        if (!existsSync(src)) throw new Error(`sourcePath not found: ${input.sourcePath}`);
+        const source = await loadExistingXMind(src, input.sourcePassword ?? input.password);
+        if (!source) throw new Error(`sourcePath is not a readable .xmind file: ${input.sourcePath}`);
+        if (!existing) {
+            existing = { ...source, resourceEntries: source.resourceEntries, encrypted: false, passwordHint: null };
+        } else {
+            const have = new Set(existing.resourceEntries.map(r => r.name));
+            existing.resourceEntries.push(...source.resourceEntries.filter(r => /^(resources|attachments)\//.test(r.name) && !have.has(r.name)));
+        }
+    }
+    if (existing?.encrypted && input.removePassword) {
+        console.error('Note: "removePassword" — the file is now saved without password protection.');
+    }
+    // An updated protected file stays protected (with its hint) unless removePassword is set.
+    const password = input.removePassword ? null : input.password;
+    const passwordHint = input.passwordHint ?? existing?.passwordHint ?? null;
     if (existing) {
         console.error(`Note: preserving theme/layout/resources from existing file at ${resolvedPath}`);
     }
@@ -2189,11 +1617,10 @@ async function main() {
 
     if (resolvedFormat === 'legacy') {
         // Legacy XML format (XMind 3–8 compatible)
-        const { resourceFiles } = await builder.finalize(contentJson, attachments, [], null, input.thumbnail);
-        legacyStyles = [];
-        const contentXml = buildLegacyXml(contentJson);
-        const stylesXml = legacyStyles.length > 0 ? buildLegacyStyles(legacyStyles) : null;
-        legacyStyles = null;
+        // Only resources the new content references are carried over (finalize drops the rest).
+        const { resourceFiles } = await builder.finalize(contentJson, attachments,
+            (existing?.resourceEntries || []).filter(r => /^(resources|attachments)\//.test(r.name)), null, input.thumbnail);
+        const { contentXml, stylesXml } = buildLegacy(contentJson);
         const metaXml = buildLegacyMeta();
         const fileEntries = { 'content.xml': {}, 'meta.xml': {}, 'META-INF/manifest.xml': {} };
         if (stylesXml) fileEntries['styles.xml'] = {};
@@ -2207,8 +1634,7 @@ async function main() {
             ...(stylesXml ? [{ name: 'styles.xml', data: Buffer.from(stylesXml, 'utf-8') }] : []),
             ...resourceFiles,
         ]);
-        await writeFile(resolvedPath, zipBuffer);
-        console.log(`Created (XMind 8 / legacy XML format): ${resolvedPath}`);
+        await writeChecked(resolvedPath, zipBuffer, null, `Created (XMind 8 / legacy XML format): ${resolvedPath}`);
     } else {
         // Modern JSON format (XMind Zen / 2020+)
         const { content, metadata, manifest, resourceFiles } = await builder.finalize(
@@ -2220,26 +1646,26 @@ async function main() {
             ...resourceFiles,
         ];
         let manifestOut = manifest;
-        if (input.password) {
-            if (typeof input.password !== 'string') throw new Error('"password" must be a string.');
+        if (password) {
+            if (typeof password !== 'string') throw new Error('"password" must be a string.');
             // A thumbnail would show the map to anyone without the password — leave it out.
             entries = entries.filter(e => !e.name.startsWith('Thumbnails/'));
             const fileEntries = {};
             entries = entries.map(e => {
-                const { data, meta } = encryptEntry(e.data, input.password);
+                const { data, meta } = encryptEntry(e.data, password);
                 fileEntries[e.name] = meta;
                 return { name: e.name, data };
             });
             manifestOut = JSON.stringify({ 'file-entries': fileEntries,
-                ...(input.passwordHint ? { 'password-hint': String(input.passwordHint) } : {}) });
+                ...(passwordHint ? { 'password-hint': String(passwordHint) } : {}) });
         }
         const zipBuffer = buildZip([
             entries[0], entries[1],
             { name: 'manifest.json', data: Buffer.from(manifestOut, 'utf-8') },
             ...entries.slice(2),
         ]);
-        await writeFile(resolvedPath, zipBuffer);
-        console.log(`Created (XMind Zen / modern JSON format${input.password ? ', password-protected' : ''}): ${resolvedPath}`);
+        await writeChecked(resolvedPath, zipBuffer, password,
+            `Created (XMind Zen / modern JSON format${password ? ', password-protected' : ''}): ${resolvedPath}`);
     }
 }
 

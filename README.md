@@ -4,6 +4,8 @@
 
 # XMind Skill
 
+https://github.com/user-attachments/assets/10ce6370-abb6-4cbf-ab64-c40b3564d07f
+
 A [Claude Code](https://claude.com/claude-code) / Claude Desktop skill that creates, reads, validates and previews
 [XMind](https://xmind.app) mind maps (`.xmind`). Ask Claude for a mind map, a project plan, a flowchart or an org
 chart in plain language, or hand it an existing `.xmind` file to analyse, search, edit or export.
@@ -58,7 +60,7 @@ Topics are matched by id, then title path, then unique title. Setting a property
 - Several files at once, or every file in a directory.
 - The reader's output can be passed back to the create script unchanged (read → edit → write).
 
-**Validation.** Checks a file against what XMind actually reads:
+**Validation.** `create_xmind.mjs` checks every file it writes, and `validate` checks any file, against what XMind actually reads:
 - unknown shapes, arrows and layouts;
 - misplaced summary topics, dangling ids and missing resources;
 - manifest problems, and legacy styles that XMind 8 ignores.
@@ -131,12 +133,16 @@ python3 $S/preview_xmind.py /tmp/demo.xmind --out-dir /tmp/xmind-preview
 
 ```
 skills/xmind/
-  SKILL.md                  Skill definition: routing, JSON format, rules
+  SKILL.md                  Skill definition: routing, workflow, rules (loaded on every use)
+  references/               Field-by-field reference, read only when needed (topics, styling,
+                            updating, flowcharts, reading)
   scripts/
-    create_xmind.mjs        Create / update .xmind files (zero npm dependencies)
-    read_xmind.mjs          Read, search, validate, export, decrypt (zero npm dependencies)
+    create_xmind.mjs        Create / update .xmind files; validates what it writes
+    read_xmind.mjs          Read, search, validate, export, decrypt
     preview_xmind.py        Offline PNG / PDF preview and thumbnail embedding (Pillow)
-tests/                      npm test: round-trip, complex, edge-case, styling and feature suites
+    lib/                    Shared modules: zip, crypto, asar (XMind library), latex,
+                            legacy-writer, validate, known (valid XMind values), util
+tests/                      npm test: round-trip, complex, edge-case, styling, feature and regression suites
 scripts/build-skill.sh      Builds build/xmind-skill.zip
 ```
 
