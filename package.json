@@ -1,0 +1,30 @@
+{
+  "name": "xmind-skill",
+  "version": "4.0.0",
+  "private": true,
+  "description": "Claude Code / Claude Desktop skill for creating, reading, validating and previewing XMind mind maps",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/roosevelt-git/xmind-skill"
+  },
+  "homepage": "https://github.com/roosevelt-git/xmind-skill#readme",
+  "keywords": [
+    "xmind",
+    "mindmap",
+    "mind-map",
+    "skill",
+    "claude-code",
+    "claude-desktop"
+  ],
+  "license": "MIT",
+  "author": "roosevelt-git",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build:skill": "bash scripts/build-skill.sh",
+    "test:create": "echo '{\"path\":\"/tmp/test.xmind\",\"sheets\":[{\"title\":\"T\",\"rootTopic\":{\"title\":\"R\"}}]}' | node skills/xmind/scripts/create_xmind.mjs",
+    "test:read": "echo '{\"action\":\"read\",\"path\":\"/tmp/test.xmind\"}' | node skills/xmind/scripts/read_xmind.mjs",
+    "test": "python3 tests/test_roundtrip.py && python3 tests/test_complex.py && python3 tests/test_edge_cases.py && python3 tests/test_styling.py && python3 tests/test_features.py"
+  }
+}

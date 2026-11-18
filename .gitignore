@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+
+# Build output
+build/
+dist/
+
+# Binary artifacts
+*.tar.gz
+*.zip
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Editor directories and files
+.idea/
+.vscode/
+*.sw?
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Lock files
+package-lock.json
+yarn.lock
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Design working files — only the README banner is published
+assets/*
+!assets/readme-hero-v2.png
+
+# Local Claude Code notes — not published
+CLAUDE.md
