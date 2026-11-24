@@ -19,7 +19,21 @@ def check(name, cond, detail=""):
         print(f"  FAIL: {name} {detail}")
 
 
+def _plain_theme(data):
+    """These checks were written for XMind's own default look (no theme). New sheets now get the dark
+    theme by default, so sheets that name no theme are given an explicit empty one here; the
+    default itself is tested in test_regressions.py."""
+    if os.path.exists(str(data.get("path", ""))):
+        return data  # updating a file: its own theme is kept, as in real use
+    data = json.loads(json.dumps(data))
+    for sh in data.get("sheets") or []:
+        if isinstance(sh, dict) and "theme" not in sh:
+            sh["theme"] = {}
+    return data
+
+
 def create(data, expect_ok=True):
+    data = _plain_theme(data)
     p = subprocess.run(["node", f"{SCRIPTS}/create_xmind.mjs"], input=json.dumps(data),
                        capture_output=True, text=True)
     if expect_ok and p.returncode != 0:

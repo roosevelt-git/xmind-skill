@@ -659,6 +659,80 @@ with zipfile.ZipFile(f"{TMP}/ctrl.xmind") as z:
                 ok_xml = str(e)
 check("control characters don't break the XML", ok_xml is True, ok_xml)
 
+print("\n--- 22: dark default theme and in-box descriptions ---")
+
+
+def lum(h):
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    f = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+
+
+def ratio(a, b):
+    la, lb = sorted((lum(a), lum(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+f = f"{TMP}/dark.xmind"
+p = create({"path": f, "sheets": [{"title": "S", "rootTopic": {"title": "Root", "description": "What this is about", "children": [
+    {"title": c, "color": c, "description": f"{c} branch", "children": [{"title": f"{c} child", "description": "detail"}]}
+    for c in ["blue", "green", "yellow", "orange", "red", "purple", "teal", "pink", "gray", "navy"]] + [{"title": "Plain", "description": "no colour"}]},
+    "relationships": [{"sourceTitle": "blue", "targetTitle": "red"}]}]})
+check("map with descriptions and title references builds", p.returncode == 0 and "Validation: ok" in p.stdout, p.stderr[-200:])
+with zipfile.ZipFile(f) as z:
+    sheet = json.loads(z.read("content.json"))[0]
+th = sheet["theme"]
+check("no theme given → dark theme", th.get("title") == "dark" and lum(th["map"]["properties"]["svg:fill"]) < 0.05, th.get("title"))
+root = sheet["rootTopic"]
+slot = lambda name: th[name]["properties"]
+check("central topic: dark fill, light text", lum(slot("centralTopic")["svg:fill"]) < 0.2 and lum(slot("centralTopic")["fo:color"]) > 0.7)
+bad = []
+for t in root["children"]["attached"]:
+    pr = t.get("style", {}).get("properties", {})
+    fill, text = pr.get("svg:fill", slot("mainTopic")["svg:fill"]), pr.get("fo:color", slot("mainTopic")["fo:color"])
+    if lum(fill) > 0.2 or ratio(fill, text) < 4.5:
+        bad.append((t["title"], fill, text, round(ratio(fill, text), 1)))
+    desc = t["attributedTitle"][-1]
+    if ratio(fill, desc["fo:color"]) < 3:
+        bad.append((t["title"], "description", desc["fo:color"], round(ratio(fill, desc["fo:color"]), 1)))
+check("every palette colour: dark fill, readable light text and description", bad == [], bad)
+check("description is a smaller second line in the same box", root["title"] == "Root\nWhat this is about"
+      and root["attributedTitle"][-1]["text"] == "\nWhat this is about"
+      and float(root["attributedTitle"][-1]["fo:font-size"][:-2]) < float(slot("centralTopic")["fo:font-size"][:-2]), root["attributedTitle"])
+_, rd = read({"action": "read", "path": f})
+check("read returns title and description apart", rd[0]["title"] == "Root" and rd[0]["description"] == "What this is about"
+      and "titleRuns" not in rd[0], {k: rd[0].get(k) for k in ("title", "description", "titleRuns")})
+p = create({"path": f, "sheets": [{"title": "S", "rootTopic": rd[0]}]})
+with zipfile.ZipFile(f) as z:
+    again = json.loads(z.read("content.json"))[0]
+check("read → write keeps one description (no duplication)", again["rootTopic"]["title"] == "Root\nWhat this is about"
+      and again["rootTopic"]["children"]["attached"][0]["style"]["properties"]["svg:fill"] == root["children"]["attached"][0]["style"]["properties"]["svg:fill"],
+      again["rootTopic"]["title"])
+_, sr = read({"action": "search_nodes", "path": f, "query": "no colour"})
+check("search finds a description", [m["title"] for m in sr["matches"]] == ["Plain"], sr["matches"])
+_, ex = read({"action": "export", "path": f, "format": "markdown"})
+check("Markdown shows the description", "## Root — What this is about" in ex["content"] and "- Plain — no colour" in ex["content"], ex["content"][:200])
+try:
+    import PIL  # noqa: F401
+    pv = subprocess.run([sys.executable, "-B", f"{SCRIPTS}/preview_xmind.py", f, "--out-dir", f"{TMP}/pvd"], capture_output=True, text=True)
+    check("preview: no contrast or overlap warnings", pv.returncode == 0 and "contrast" not in pv.stdout and "overlap" not in pv.stdout, pv.stdout[-300:])
+except ImportError:
+    pass
+
+f = f"{TMP}/light.xmind"
+create({"path": f, "sheets": [{"title": "S", "theme": "clean", "rootTopic": {"title": "R", "children": [{"title": "b", "color": "blue", "description": "d"}]}}]})
+with zipfile.ZipFile(f) as z:
+    lt = json.loads(z.read("content.json"))[0]
+b = lt["rootTopic"]["children"]["attached"][0]
+check("an asked-for light theme keeps the light palette", b["style"]["properties"]["svg:fill"] == "#A5D8FF" and lum(b["attributedTitle"][-1]["fo:color"]) < 0.3, b["style"])
+create({"path": f, "sheets": [{"title": "S", "rootTopic": {"title": "R", "children": [{"title": "b", "color": "green"}]}}]})
+with zipfile.ZipFile(f) as z:
+    up = json.loads(z.read("content.json"))[0]
+check("updating a light map keeps its theme and light colours", up["theme"].get("title") == "clean"
+      and up["rootTopic"]["children"]["attached"][0]["style"]["properties"]["svg:fill"] == "#B2F2BB", up["theme"].get("title"))
+p = one(f"{TMP}/baddesc.xmind", {"title": "R", "description": 5})
+check("a non-text description is an error", p.returncode != 0 and "description" in p.stderr, p.stderr[-150:])
+
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n" + "=" * 60)
 print(f"Results: {passed} passed, {len(failed)} failed")

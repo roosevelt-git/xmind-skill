@@ -155,13 +155,48 @@ const PALETTE = {
     white:  { fill: '#FFFFFF', border: '#868E96', text: DARK_TEXT },
 };
 
+// The same names on a dark canvas (the default theme): deep fill, bright border of the hue, light
+// text. Chosen per sheet from its map background, so `"color": "blue"` reads on either canvas.
+const DARK_PALETTE = {
+    blue:   { fill: '#1C3A5E', border: '#4DABF7', text: '#E7F5FF' },
+    green:  { fill: '#1E3D2A', border: '#51CF66', text: '#EBFBEE' },
+    yellow: { fill: '#3D3412', border: '#FCC419', text: '#FFF9DB' },
+    orange: { fill: '#432A17', border: '#FF922B', text: '#FFF4E6' },
+    red:    { fill: '#441F23', border: '#FF6B6B', text: '#FFF5F5' },
+    purple: { fill: '#2F2652', border: '#9775FA', text: '#F3F0FF' },
+    teal:   { fill: '#113B39', border: '#38D9A9', text: '#E6FCF5' },
+    pink:   { fill: '#421F30', border: '#F06595', text: '#FFF0F6' },
+    gray:   { fill: '#2B3036', border: '#868E96', text: '#F1F3F5' },
+    navy:   { fill: '#1E3A5F', border: '#4DABF7', text: '#FFFFFF' },
+    white:  { fill: '#F8F9FA', border: '#868E96', text: DARK_TEXT },
+};
+let darkCanvas = false;           // set per sheet while its topics are built
+const palette = () => (darkCanvas ? DARK_PALETTE : PALETTE);
+
+// A new sheet without a "theme" gets this one: dark canvas, light text.
+export const DEFAULT_THEME = 'dark';
+
+function isDarkHex(hex) {
+    const m = /^#([0-9a-f]{6})/i.exec(String(hex || ''));
+    if (!m) return false;
+    const [r, g, b] = [0, 2, 4].map(i => parseInt(m[1].slice(i, i + 2), 16) / 255);
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.4;
+}
+
+function mixHex(a, b, t) {
+    const pa = /^#([0-9a-f]{6})/i.exec(a), pb = /^#([0-9a-f]{6})/i.exec(b);
+    if (!pa || !pb) return a;
+    const ch = (h, i) => parseInt(h.slice(i, i + 2), 16);
+    return '#' + [0, 2, 4].map(i => Math.round(ch(pa[1], i) * (1 - t) + ch(pb[1], i) * t).toString(16).padStart(2, '0')).join('').toUpperCase();
+}
+
 function toPt(v) {
     if (v === undefined || v === null) return undefined;
     return typeof v === 'number' ? `${v}pt` : String(v);
 }
 
 function resolveColor(name, where) {
-    const c = PALETTE[name];
+    const c = palette()[name];
     if (!c) throw new Error(`Unknown color "${name}" in ${where}. Use one of: ${Object.keys(PALETTE).join(', ')} — or "fill": "#RRGGBB".`);
     return c;
 }
@@ -177,7 +212,7 @@ function hexColor(value, field, where) {
 
 // Relationship `color` accepts a palette name (its border shade) or a hex colour.
 function lineColor(value, where) {
-    if (PALETTE[value]) return PALETTE[value].border;
+    if (palette()[value]) return palette()[value].border;
     if (typeof value === 'string' && HEX_COLOR.test(value)) return value;
     throw new Error(`${where}: unknown color ${JSON.stringify(value)}. Use a hex colour like "#E03131" ` +
         `or one of: ${Object.keys(PALETTE).join(', ')}.`);
@@ -396,8 +431,8 @@ const THEME_PRESETS = {
     // Dark canvas, light text.
     dark: {
         map: { background: '#1B1F24', multiLineColors: 'none' },
-        centralTopic: { fill: '#4DABF7', textColor: '#0B1A2A', bold: true, fontSize: 28, borderWidth: 0,
-            lineColor: '#ADB5BD', lineWidth: 3, branchLine: 'curve' },
+        centralTopic: { fill: '#1864AB', borderColor: '#4DABF7', borderWidth: 2, textColor: '#F8F9FA', bold: true,
+            fontSize: 28, lineColor: '#ADB5BD', lineWidth: 3, branchLine: 'curve' },
         mainTopic: { fill: '#2B3036', borderColor: '#4DABF7', borderWidth: 2, textColor: '#F1F3F5', bold: true,
             fontSize: 18, lineColor: '#868E96', lineWidth: 2, branchLine: 'roundedElbow' },
         subTopic: { fill: '#22262B', borderColor: '#495057', borderWidth: 1, textColor: '#E9ECEF', fontSize: 14,
@@ -424,7 +459,7 @@ function themeSlotProps(slot, spec) {
         if (spec.multiLineColors != null) {
             // Rainbow branches: a list of colours, one per main branch (or "none").
             const v = Array.isArray(spec.multiLineColors)
-                ? spec.multiLineColors.map(c => PALETTE[c]?.border || hexColor(c, 'multiLineColors', where)).join(' ')
+                ? spec.multiLineColors.map(c => palette()[c]?.border || hexColor(c, 'multiLineColors', where)).join(' ')
                 : spec.multiLineColors;
             p['multi-line-colors'] = v;
             p['color-list'] = v;
@@ -584,22 +619,33 @@ function childKey(parentKey, title, seen) {
     return `${parentKey}\u0000${title}#${n}`;
 }
 
+// A topic's title without its description line (see addDescription), for pairing with the input.
+export function ownTitle(t) {
+    const runs = t?.attributedTitle;
+    const last = runs?.length > 1 ? runs[runs.length - 1] : null;
+    if (typeof t?.title === 'string' && typeof last?.text === 'string' && last.text.startsWith('\n') && t.title.endsWith(last.text)) {
+        return t.title.slice(0, -last.text.length);
+    }
+    return t?.title;
+}
+
 function indexExistingTopics(rootTopic) {
     const index = { byKey: new Map(), byId: new Map(), byTitle: new Map(), newTitleCount: new Map() };
     const walk = (t, key) => {
         index.byKey.set(key, t);
         if (t.id) index.byId.set(t.id, t);
         if (typeof t.title === 'string') {
-            if (!index.byTitle.has(t.title)) index.byTitle.set(t.title, []);
-            index.byTitle.get(t.title).push(t);
+            const title = ownTitle(t);
+            if (!index.byTitle.has(title)) index.byTitle.set(title, []);
+            index.byTitle.get(title).push(t);
         }
         const seen = new Map();
-        for (const c of t.children?.attached || []) walk(c, childKey(key, c.title, seen));
+        for (const c of t.children?.attached || []) walk(c, childKey(key, ownTitle(c), seen));
     };
     if (rootTopic) {
         walk(rootTopic, ROOT_KEY);
         const seen = new Map();
-        for (const d of rootTopic.children?.detached || []) walk(d, childKey(DETACHED_KEY, d.title, seen));
+        for (const d of rootTopic.children?.detached || []) walk(d, childKey(DETACHED_KEY, ownTitle(d), seen));
     }
     return index;
 }
@@ -658,8 +704,8 @@ function attributedTitle(runs, where) {
         const out = { text: run.text };
         if (run.bold != null) out['fo:font-weight'] = run.bold ? 'bold' : 'normal';
         if (run.italic != null) out['fo:font-style'] = run.italic ? 'italic' : 'normal';
-        if (run.color != null) out['fo:color'] = PALETTE[run.color]?.border || hexColor(run.color, 'titleRuns color', where);
-        if (run.highlight != null) out['fo:background-color'] = PALETTE[run.highlight]?.fill || hexColor(run.highlight, 'titleRuns highlight', where);
+        if (run.color != null) out['fo:color'] = palette()[run.color]?.border || hexColor(run.color, 'titleRuns color', where);
+        if (run.highlight != null) out['fo:background-color'] = palette()[run.highlight]?.fill || hexColor(run.highlight, 'titleRuns highlight', where);
         if (run.underline != null || run.strike != null) out['fo:text-decoration'] = textDecoration(run);
         if (run.fontSize != null) out['fo:font-size'] = toPt(run.fontSize);
         if (run.fontFamily != null) out['fo:font-family'] = run.fontFamily;
@@ -815,8 +861,14 @@ class XMindBuilder {
         });
 
         const builtSheets = [];
-        for (const [sheetIndex, sheet] of sheets.entries()) {
+        for (let [sheetIndex, sheet] of sheets.entries()) {
             this.sheetIndex = sheetIndex;
+            // A new sheet without a theme gets the default (dark) one; an existing sheet keeps its own.
+            const knownSheet = existingSheetsByTitle?.get(sheet.title)?.[0];
+            if (sheet.theme === undefined && !knownSheet) sheet = { ...sheet, theme: DEFAULT_THEME };
+            const builtTheme = sheet.theme ? buildTheme(sheet.theme) : knownSheet?.theme || {};
+            darkCanvas = isDarkHex(builtTheme.map?.properties?.['svg:fill']);
+            this.themeSlots = builtTheme;
             this.customMarkerIds = new Set([...(sheet.customMarkers || sheet.rootTopic?.customMarkers || []).map(m => String(m.id)),
                 ...(existingSheetsByTitle?.get(sheet.title)?.[0]?.customMarkerGroups || []).flatMap(g => (g.markers || []).map(m => m.id))]);
             // Sheets with duplicate titles are matched in order (first existing sheet with this
@@ -830,10 +882,10 @@ class XMindBuilder {
             const rootTopic = this.buildTopic(sheet.rootTopic, { key: ROOT_KEY });
             const seen = new Map();
             const detached = sheet.detachedTopics?.map(t => this.buildTopic(t, {
-                detached: true, key: childKey(DETACHED_KEY, t.title, seen),
+                detached: true, key: childKey(DETACHED_KEY, t.title, seen), depth: 1,
             }));
             this.existingIndex = null;
-            builtSheets.push({ rootTopic, detached, sheet, existingSheet });
+            builtSheets.push({ rootTopic, detached, sheet, existingSheet, builtTheme, darkCanvas });
         }
 
         // References are resolved after every sheet is built so that duplicate titles anywhere
@@ -847,11 +899,11 @@ class XMindBuilder {
             }
         }
 
-        const contentJson = builtSheets.map(({ rootTopic, detached, sheet, existingSheet }, sheetIndex) => {
+        const contentJson = builtSheets.map(({ rootTopic, detached, sheet, existingSheet, builtTheme }, sheetIndex) => {
             // An explicit `theme` wins. Otherwise preserve the previous sheet's visual theme when
             // a sheet with the same title already existed — without this, every regeneration
             // resets styling to XMind's bare default.
-            const sheetTheme = sheet.theme ? buildTheme(sheet.theme)
+            const sheetTheme = sheet.theme ? builtTheme
                 : existingSheet?.theme ? existingSheet.theme : {};
             const hasPlanned = this.hasPlannedTasks(sheet.rootTopic);
             if (detached?.length > 0) {
@@ -1251,7 +1303,30 @@ class XMindBuilder {
         return (input.children || []).some(c => this.hasPlannedTasks(c));
     }
 
-    buildTopic(input, { detached = false, key = null } = {}) {
+    // A short explanation shown inside the topic's own box, under the title: a second line in a
+    // smaller, softer type (one attributedTitle run), so it is read on the map without opening notes.
+    addDescription(topic, input, styleProps, depth, where, detached = false) {
+        if (typeof input.description !== 'string') throw new Error(`${where}: "description" must be a string.`);
+        const text = input.description.replace(/\s*\n\s*/g, ' ').trim();
+        if (!text) return;
+        // The topic's own style over its theme slot: the description is a softer shade of the
+        // text colour that is actually drawn on that fill, at about ¾ of the title size.
+        const slot = depth === 0 ? 'centralTopic' : detached ? 'floatingTopic' : depth === 1 ? 'mainTopic' : 'subTopic';
+        const look = { ...(this.themeSlots?.[slot]?.properties || {}), ...styleProps };
+        const own = parseFloat(look['fo:font-size']);
+        const base = Number.isFinite(own) ? own : depth === 0 ? 28 : depth === 1 ? 18 : 14;
+        const size = Math.max(10, Math.round(base * (depth === 0 ? 0.7 : depth === 1 ? 0.75 : 0.8)));
+        const textColor = look['fo:color'], fill = look['svg:fill'];
+        const color = textColor && fill && fill !== 'none' ? mixHex(textColor, fill, 0.3)
+            : textColor || (darkCanvas ? '#ADB5BD' : '#5C636A');
+        const runs = topic.attributedTitle?.length && topic.attributedTitle.map(r => r.text ?? '').join('') === topic.title
+            ? topic.attributedTitle : [{ text: topic.title }];
+        topic.attributedTitle = [...runs,
+            { text: `\n${text}`, 'fo:font-size': `${size}pt`, 'fo:font-weight': 'normal', 'fo:font-style': 'normal', 'fo:color': color }];
+        topic.title = `${topic.title}\n${text}`;
+    }
+
+    buildTopic(input, { detached = false, key = null, depth = 0 } = {}) {
         const id = generateId();
         this.topicSheet.set(id, this.sheetIndex);
         if (!this.titleToId.has(input.title)) this.titleToId.set(input.title, id);
@@ -1311,6 +1386,9 @@ class XMindBuilder {
         const where = `Topic "${input.title}"`;
         // Rich-text title: [{text, bold?, italic?, color?, highlight?, underline?, strike?, fontSize?, fontFamily?}]
         if (Array.isArray(input.titleRuns)) topic.attributedTitle = attributedTitle(input.titleRuns, where);
+        if (input.description != null && input.description !== '') {
+            this.addDescription(topic, input, styleProps, depth, where, detached);
+        }
         if (input.folded != null) {
             if (input.folded) topic.branch = 'folded';
         } else if (previous?.branch) {
@@ -1451,7 +1529,7 @@ class XMindBuilder {
 
         const seen = new Map();
         const attached = input.children?.length > 0
-            ? input.children.map(c => this.buildTopic(c, { key: key ? childKey(key, c.title, seen) : null }))
+            ? input.children.map(c => this.buildTopic(c, { key: key ? childKey(key, c.title, seen) : null, depth: depth + 1 }))
             : undefined;
         if (input.numberChildren === false && attached) {
             // Remove numbering carried over from the existing file.

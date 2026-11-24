@@ -38,6 +38,7 @@ Each topic object supports:
 | Field | Type | Description |
 |-------|------|-------------|
 | `title` | string (required) | Topic title |
+| `description` | string | Short explanation inside the topic's box: a second line under the title, about ¾ of its size, in a softer shade of the text colour (an XMind rich-text run). The default way to explain a topic; `read` returns it as `description`, and search / export include it. Titles used by relationships and links stay the `title` alone. XMind 8 output has no rich text: there it is a plain second line |
 | `children` | array of topics | Child topics |
 | `notes` | string or `{plain?, html?}` | Notes. HTML supports: `<strong>`, `<u>`, `<ul>`, `<ol>`, `<li>`, `<br>`. NOT `<code>`. |
 | `href` | string | External URL link |
@@ -53,7 +54,7 @@ Each topic object supports:
 | `position` | `{x, y}` | Absolute position (only for detached topics in free-positioning sheets) |
 | `ref` | string | Unique key for this topic. Reference it with `sourceRef` / `targetRef` / `linkToRef` / dependency `targetRef` — needed when titles repeat |
 | `linkToRef` | string | Like `linkToTopic`, but targets a topic by `ref` |
-| `color` | palette name | Fill + matching border + readable text colour: `blue`, `green`, `yellow`, `orange`, `red`, `purple`, `teal`, `pink`, `gray`, `navy` (white text), `white` |
+| `color` | palette name | Fill + matching border + readable text colour: `blue`, `green`, `yellow`, `orange`, `red`, `purple`, `teal`, `pink`, `gray`, `navy`, `white`. On a dark canvas (the default theme) a deep fill with light text, on a light one a pastel fill with dark text |
 | `fill` / `borderColor` / `textColor` | `"#RRGGBB"` | Exact colours (override `color`). Must be hex (`#RGB`, `#RRGGBB`, `#RRGGBBAA`) or `"none"` — CSS names like `"red"` are rejected |
 | `borderWidth` / `fontSize` / `lineWidth` | number (pt) or `"2pt"` | Border width, font size, width of the line to this topic's children |
 | `width` | number (px) | Fixed text width — long titles wrap inside it (XMind's `customWidth`) |

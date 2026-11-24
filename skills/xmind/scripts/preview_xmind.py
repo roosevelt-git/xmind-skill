@@ -441,6 +441,15 @@ class Sheet:
             title = title.lower()
         elif p.get("fo:text-transform") == "capitalize":
             title = title.title()
+        # A last title run that starts a new line is the topic's description (create_xmind.mjs
+        # "description"): drawn under the title in its own smaller size and colour.
+        runs = t.get("attributedTitle") or []
+        last = runs[-1] if len(runs) > 1 and isinstance(runs[-1], dict) else None
+        desc = None
+        if last and str(last.get("text", "")).startswith("\n") and title.endswith(last["text"]):
+            title = title[: -len(last["text"])]
+            dpx = pt(last.get("fo:font-size"), px * 0.72)
+            desc = {"text": last["text"][1:], "f": font(dpx, False), "lh": dpx * 1.3, "color": last.get("fo:color")}
         lines = (prefix + title).split("\n")
         if t.get("customWidth"):
             cw = float(t["customWidth"])
@@ -458,7 +467,14 @@ class Sheet:
         padx, pady = px * 0.9, px * 0.55
         w = max([text_width(l, f) for l in lines] or [0]) + 2 * padx
         h = (lh * len(lines) if any(lines) else 0) + 2 * pady
-        t.update(_f=f, _lines=lines, _lh=lh, _padx=padx, _pady=pady)
+        if desc:
+            dlines = desc["text"].split("\n")
+            width_for = float(t["customWidth"]) if t.get("customWidth") else max(w - 2 * padx, 240)
+            dlines = [x for line in dlines for x in wrap(line, desc["f"], width_for)]
+            desc["lines"] = dlines
+            w = max(w, max(text_width(x, desc["f"]) for x in dlines) + 2 * padx)
+            h += desc["lh"] * len(dlines) + px * 0.15
+        t.update(_f=f, _lines=lines, _lh=lh, _padx=padx, _pady=pady, _desc=desc)
         extra = 0
         if t.get("labels"):
             extra += 22
@@ -1055,6 +1071,15 @@ class Sheet:
             if "line-through" in deco:
                 d.line([P(tx, ty + n["_lh"] * 0.45), P(tx + lw, ty + n["_lh"] * 0.45)], fill=color, width=max(1, int(S)))
             ty += n["_lh"]
+        desc = n.get("_desc")
+        if desc:
+            ty += font_px(f) * 0.15
+            dfs = font(font_px(desc["f"]) * S, False)
+            dcolor = desc["color"] or color
+            for line in desc["lines"]:
+                lw = text_width(line, desc["f"])
+                draw_text(img, d, P(n["_x"] + mk + left_img + (text_w - lw) / 2, ty), line, dfs, dcolor)
+                ty += desc["lh"]
         for i, m in enumerate(n.get("markers") or []):
             mid = m.get("markerId", "") if isinstance(m, dict) else str(m)
             c = {"task": "#2F9E44", "priority": "#E03131", "flag": "#F08C00", "star": "#FAB005"}.get(mid.split("-")[0], "#1971C2")

@@ -709,8 +709,17 @@ function processNode(node, sheetTitle) {
     }
     if (node.position) result.position = node.position;
     if (node.branch === 'folded') result.folded = true;
-    // Rich-text title runs, in the friendly shape create_xmind.mjs accepts.
-    const runs = node.attributedTitle || [];
+    // Rich-text title runs, in the friendly shape create_xmind.mjs accepts. A last run that starts a
+    // new line is the topic's description (create_xmind.mjs "description"): returned on its own.
+    let runs = node.attributedTitle || [];
+    const lastRun = runs.length > 1 ? runs[runs.length - 1] : null;
+    if (typeof lastRun?.text === 'string' && lastRun.text.startsWith('\n') && typeof result.title === 'string'
+        && result.title.endsWith(lastRun.text)) {
+        result.title = result.title.slice(0, -lastRun.text.length);
+        result.description = lastRun.text.slice(1);
+        runs = runs.slice(0, -1);
+        if (runs.length === 1 && Object.keys(runs[0]).length === 1) runs = [];
+    }
     if (runs.length > 1 || runs.some(r => Object.keys(r).length > 1)) {
         result.titleRuns = runs.map(r => {
             const o = { text: r.text ?? '' };
@@ -1124,7 +1133,7 @@ function actionSearchNodes(input) {
 
         const matchedIn = [];
         if (searchQuery !== '') {
-            if (searchFields.includes('title') && matchesText(node.title)) matchedIn.push('title');
+            if (searchFields.includes('title') && (matchesText(node.title) || matchesText(node.description))) matchedIn.push('title');
             if (searchFields.includes('notes') && (matchesText(node.notes?.content) || matchesText(htmlText(node.notes?.html)))) matchedIn.push('notes');
             if (searchFields.includes('labels') && node.labels?.some(l => matchesText(l))) matchedIn.push('labels');
             if (searchFields.includes('callouts') && node.callouts?.some(c => matchesText(c.title))) matchedIn.push('callouts');
@@ -1255,6 +1264,7 @@ const mdTitle = t => {
     let s = t.title ? mdText(t.title)
         : t.equation ? `\`$${String(t.equation).replace(/[\r\n\u2028\u2029]+/g, ' ').replace(/`/g, "'")}$\`` : '';
     if (t.href && /^(https?:|mailto:)/i.test(t.href)) s = `[${s || mdText(t.href)}](${mdUrl(t.href)})`;
+    if (t.description) s += ` — ${mdText(t.description)}`;
     if (t.labels?.length) s += ` *(${t.labels.map(mdText).join(', ')})*`;
     return s;
 };
@@ -1280,7 +1290,7 @@ function exportOpml(roots, name) {
     const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/\n/g, '&#10;');
     const node = (t, ind) => {
         const note = plainNote(t);
-        const attrs = `text="${esc(t.title)}"${note ? ` _note="${esc(note)}"` : ''}`;
+        const attrs = `text="${esc(t.description ? `${t.title} — ${t.description}` : t.title)}"${note ? ` _note="${esc(note)}"` : ''}`;
         const kids = [...(t.children || []), ...(t.detachedTopics || [])];
         if (kids.length === 0) return `${ind}<outline ${attrs}/>`;
         return `${ind}<outline ${attrs}>\n${kids.map(c => node(c, ind + '  ')).join('\n')}\n${ind}</outline>`;
@@ -1290,7 +1300,7 @@ function exportOpml(roots, name) {
 }
 
 function exportText(t, depth) {
-    const lines = [`${'\t'.repeat(depth)}${(t.title || '').replace(/\n/g, ' ')}`];
+    const lines = [`${'\t'.repeat(depth)}${(t.title || '').replace(/\n/g, ' ')}${t.description ? ` — ${t.description.replace(/\n/g, ' ')}` : ''}`];
     for (const c of t.children || []) lines.push(exportText(c, depth + 1));
     for (const d of t.detachedTopics || []) lines.push(exportText(d, depth + 1));
     return lines.join('\n');

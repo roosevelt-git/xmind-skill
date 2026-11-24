@@ -4,11 +4,11 @@ Themes, colours, fonts, images and the per-sheet extras (legend, watermark, text
 
 ## Styling: themes, colours, images
 
-Unstyled maps open in XMind's bare default look. For anything you hand over:
+A new sheet without a `theme` gets **`"dark"`** (dark canvas, dark boxes, light text). Palette colours follow the canvas: on a dark canvas `"color": "blue"` is a deep blue fill with a bright blue border and light text; on a light canvas it is a pastel fill with dark text. An existing file keeps its theme when it is updated.
 
-- Set a sheet `theme`: `"clean"` (white canvas, navy central topic, grey connectors, dashed red relationships) or `"dark"`. Override slots with an object: `{"preset": "clean", "mainTopic": {"fontSize": 20}, "map": {"background": "#FFFFFF"}}`. Slots: `map` (`background`, `multiLineColors`), `centralTopic`, `mainTopic`, `subTopic`, `floatingTopic`, `calloutTopic`, `summaryTopic`, `relationship`, `boundary`, `summary` — topic slots take the same keys as topic styling.
-- Colour topics **by meaning, not by position** (e.g. yellow = people, purple = AI, blue = process step, teal = storage, red = rule / open question) and explain the colours in the central topic's `notes`.
-- Keep titles to 1–2 short lines (use `\n`); put detail in `notes`. Lines over ~40 characters make wide boxes.
+- Set a sheet `theme` only when another look is wanted: `"clean"` (white canvas, navy central topic, grey connectors, dashed red relationships), `"colorful"`, `"handDrawn"`, or `"dark"`. Override slots with an object: `{"preset": "clean", "mainTopic": {"fontSize": 20}, "map": {"background": "#FFFFFF"}}`. Slots: `map` (`background`, `multiLineColors`), `centralTopic`, `mainTopic`, `subTopic`, `floatingTopic`, `calloutTopic`, `summaryTopic`, `relationship`, `boundary`, `summary` — topic slots take the same keys as topic styling.
+- Colour topics **by meaning, not by position** (e.g. yellow = people, purple = AI, blue = process step, teal = storage, red = rule / open question) and explain the colours in the central topic's `description`.
+- Keep titles to one short line and explain with `description` (shown in the box, smaller and softer); keep `notes` for longer detail. Lines over ~40 characters make wide boxes.
 - Use `labels` for cross-cutting tags you want to filter by in XMind (e.g. `"open decision"`).
 - More presets: `"colorful"` (a colour per main branch, tapered lines) and `"handDrawn"` (sketch look). The map slot also takes `multiLineColors: ["#FF6B6B", "red", …]` (one colour per main branch) and `lineTapered: true`.
 - Palette colours always set a matching text colour; if you combine `fill` and `textColor` yourself, keep them readable — `preview_xmind.py` warns about low-contrast titles.

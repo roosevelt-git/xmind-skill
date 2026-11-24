@@ -94,12 +94,12 @@ Minimal input:
   "path": "/Users/me/Desktop/plan.xmind",
   "sheets": [{
     "title": "Plan",
-    "theme": "clean",
     "rootTopic": {
       "title": "Launch",
+      "description": "Q3 product release",
       "structureClass": "org.xmind.ui.map.clockwise",
       "children": [
-        {"title": "Build", "color": "blue", "notes": "What gets built and by whom.",
+        {"title": "Build", "color": "blue", "description": "API and UI work",
          "children": [{"title": "API", "taskStatus": "todo"}, {"title": "UI", "taskStatus": "done"}]},
         {"title": "Market", "color": "green", "labels": ["Q3"], "markers": ["priority-1"]}
       ]
@@ -113,8 +113,9 @@ Minimal input:
 
 | Field | Description |
 |-------|-------------|
-| `title` (required) · `children` | Topic text (use `\n` for a second line) · child topics |
-| `notes` | Plain string, or `{"html": "…"}` with `<strong> <u> <ul> <ol> <li> <br>` only |
+| `title` (required) · `children` | Topic text · child topics |
+| `description` | Short explanation shown **inside the box**, under the title, in smaller softer type — the default way to explain a topic |
+| `notes` | Longer detail behind a note icon: plain string, or `{"html": "…"}` with `<strong> <u> <ul> <ol> <li> <br>` only |
 | `labels` · `markers` | Tags · marker ids (`task-done`, `priority-1`, `flag-red`, …) |
 | `href` · `attachment` · `linkToTopic` | Web link · embedded file · link to another topic (any sheet) |
 | `ref` | Unique key, for `sourceRef` / `targetRef` / `linkToRef` when titles repeat |
@@ -167,9 +168,14 @@ Field details: `references/reading.md`.
 - A title referenced by relationships, links or dependencies must be unique in the workbook (otherwise
   "ambiguous" error) — give the topic a `ref` and use `sourceRef` / `targetRef` / `linkToRef`. Relationships
   connect topics on the same sheet; use `linkToTopic` across sheets.
-- Keep titles short (1–2 lines); put detail in `notes`. How much to write in notes follows the user's
-  request: a quick brainstorm needs none, a study map or a plan benefits from a few sentences on the topics
-  that need explaining. Don't just repeat the title.
+- Keep titles short. Explain a topic with a `description` (one short line, about 3–8 words, shown in
+  the box) rather than `notes` — only the topics that need it; a quick brainstorm needs none. Use
+  `notes` only for longer detail that won't fit a line, or when the user asks for notes. Don't repeat
+  the title.
+- Colours: a new sheet without a `theme` gets the dark theme (dark canvas, dark boxes, light text), and
+  palette colours (`"color": "blue"`) come out as deep fills with light text. Only pick a light theme
+  (`"clean"`, `"colorful"`, …) when the user asks for one (e.g. for printing). An existing file keeps
+  its own theme.
 - HTML notes support `<strong> <u> <ul> <ol> <li> <br>` only (`<code>` is not supported).
 - Flowcharts and algorithm diagrams: `references/flowcharts.md`. XMind 8 / legacy output and format
   aliases: `references/updating.md` ("Format compatibility").

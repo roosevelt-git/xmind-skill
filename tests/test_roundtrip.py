@@ -18,7 +18,21 @@ import atexit; atexit.register(shutil.rmtree, TEST_DIR, True)
 
 # ── Helpers ──
 
+def _plain_theme(data):
+    """These checks were written for XMind's own default look (no theme). New sheets now get the dark
+    theme by default, so sheets that name no theme are given an explicit empty one here; the
+    default itself is tested in test_regressions.py."""
+    if os.path.exists(str(data.get("path", ""))):
+        return data  # updating a file: its own theme is kept, as in real use
+    data = json.loads(json.dumps(data))
+    for sh in data.get("sheets") or []:
+        if isinstance(sh, dict) and "theme" not in sh:
+            sh["theme"] = {}
+    return data
+
+
 def create(input_data):
+    input_data = _plain_theme(input_data)
     p = subprocess.run(
         ["node", f"{SCRIPT_DIR}/create_xmind.mjs"],
         input=json.dumps(input_data), capture_output=True, text=True
